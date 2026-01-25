@@ -7,9 +7,6 @@ const PORT = process.env.PORT || 8080;
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
 const RUN_DEFAULT = "001";
 
-// Change ce tag à chaque fois si tu veux vérifier un nouveau déploiement
-const BUILD_TAG = "v1.0.0-arome-latest-enabled";
-
 // ===== HELPERS =====
 function capabilitiesUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCapabilities?service=WCS&version=2.0.1&language=fre`;
@@ -38,15 +35,17 @@ function latestRunStamp(ids) {
 
     if (best === null || t > best) {
       best = t;
-      bestStr = mm[1]; // garde le format MF
+      bestStr = mm[1];
     }
   }
-  return bestStr; // ex: 2026-01-24T00.00.00Z
+  return bestStr; // ex: 2026-01-25T00.00.00Z
 }
 
 function pickCoverage(ids, stamp) {
   const find = (s) => ids.find((x) => x === s) || null;
 
+  // ⚠️ Ces patterns peuvent ne pas matcher selon le naming exact des coverageId.
+  // On les ajustera après avoir consulté /v1/arome/ids?filter=...
   return {
     rain_1h: find(`TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE__${stamp}_PT1H`),
     gust_1h: find(`WIND_SPEED_GUST_MAX__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__${stamp}_PT1H`),
@@ -68,16 +67,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// Version (preuve que c’est bien ce code qui tourne)
-app.get("/__version", (req, res) => {
-  res.json({
-    ok: true,
-    build: BUILD_TAG,
-    now: new Date().toISOString()
-  });
-});
-
-// 1) Capabilities XML brut (proxy)
+// 1) Capabilities XML brut
 app.get("/v1/arome/capabilities", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT).trim();
@@ -104,7 +94,53 @@ app.get("/v1/arome/capabilities", async (req, res) => {
   }
 });
 
-// 2) Latest run + CoverageIds utiles (JSON)
+// 2) Debug: liste les CoverageId (filtrable)
+app.get("/v1/arome/ids", async (req, res) => {
+  try {
+    const run = String(req.query.run || RUN_DEFAULT).trim();
+    const filter = String(req.query.filter || "").trim().toUpperCase();
+    const url = capabilitiesUrl(run);
+
+    const r = await fetch(url, {
+      headers: {
+        apikey: process.env.AROME_APIKEY || "",
+        accept: "application/xml,text/xml,*/*"
+      }
+    });
+
+    const xml = await r.text();
+    if (!r.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: "mf_error",
+        status: r.status,
+        detail: xml.slice(0, 400)
+      });
+    }
+
+    const ids = extractCoverageIds(xml);
+
+    const filtered = filter
+      ? ids.filter((x) => x.toUpperCase().includes(filter))
+      : ids;
+
+    res.json({
+      ok: true,
+      run,
+      filter: filter || null,
+      count: filtered.length,
+      sample: filtered.slice(0, 200)
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "ids_failed",
+      message: String(e?.message || e)
+    });
+  }
+});
+
+// 3) Latest run + CoverageIds utiles (JSON)
 app.get("/v1/arome/latest", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT).trim();
@@ -118,7 +154,6 @@ app.get("/v1/arome/latest", async (req, res) => {
     });
 
     const xml = await r.text();
-
     if (!r.ok) {
       return res.status(502).json({
         ok: false,
@@ -130,9 +165,7 @@ app.get("/v1/arome/latest", async (req, res) => {
 
     const ids = extractCoverageIds(xml);
     const stamp = latestRunStamp(ids);
-    if (!stamp) {
-      return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
-    }
+    if (!stamp) return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
 
     const coverage = pickCoverage(ids, stamp);
 
