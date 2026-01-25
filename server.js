@@ -35,12 +35,9 @@ function latestRunStamp(ids) {
   return bestStr;
 }
 
-// ---- helpers pluie ----
+// ---- pluie ----
 function pickRainIds(ids, stamp) {
-  // On cherche les IDs EXACTS du run stamp, et les produits de pluie
-  // Vu ta capture, c'est TOTAL_WATER_PRECIPITATION__GROUND_OR_WATER_SURFACE__<stamp>_PT1H
   const byStamp = ids.filter((x) => x.includes(`__${stamp}_`));
-
   const pick = (suffix) =>
     byStamp.find((x) =>
       x.startsWith("TOTAL_WATER_PRECIPITATION__GROUND_OR_WATER_SURFACE__") &&
@@ -52,8 +49,28 @@ function pickRainIds(ids, stamp) {
     pt3h: pick("_PT3H"),
     pt6h: pick("_PT6H"),
     pt12h: pick("_PT12H"),
-    p1d: pick("_P1D"), // parfois dispo
-    p2d: pick("_P2D")
+    p1d: pick("_P1D"),
+    p2d: pick("_P2D"),
+  };
+}
+
+// ---- rafales ----
+function pickGustIds(ids, stamp) {
+  const byStamp = ids.filter((x) => x.includes(`__${stamp}`)); // gust peut être ...__stamp_PT1H ou ...__stamp (selon produit)
+  const pick = (suffix) =>
+    byStamp.find((x) =>
+      x.startsWith("WIND_SPEED_GUST_MAX__") &&
+      x.endsWith(suffix)
+    ) || null;
+
+  // certains produits n'ont pas tous les pas, on renvoie ce qui existe
+  return {
+    pt1h: pick("_PT1H"),
+    pt3h: pick("_PT3H"),
+    pt6h: pick("_PT6H"),
+    pt12h: pick("_PT12H"),
+    // fallback : parfois gust max instantané sans suffixe
+    instant: byStamp.find((x) => x.startsWith("WIND_SPEED_GUST_MAX__") && !x.includes("_PT")) || null
   };
 }
 
@@ -63,7 +80,7 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
-// Capabilities XML brut (pour debug)
+// Capabilities XML brut
 app.get("/v1/arome/capabilities", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT);
@@ -80,7 +97,7 @@ app.get("/v1/arome/capabilities", async (req, res) => {
   }
 });
 
-// Debug IDs filtrés
+// Debug IDs (filtre)
 app.get("/v1/arome/ids", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT);
@@ -92,7 +109,6 @@ app.get("/v1/arome/ids", async (req, res) => {
 
     const xml = await r.text();
     const ids = extractCoverageIds(xml);
-
     const filtered = filter ? ids.filter((x) => x.toUpperCase().includes(filter)) : ids;
 
     res.json({ ok: true, run, filter: filter || null, count: filtered.length, sample: filtered.slice(0, 200) });
@@ -101,7 +117,7 @@ app.get("/v1/arome/ids", async (req, res) => {
   }
 });
 
-// ✅ Nouveau: pluie latest (mapping propre)
+// Pluie latest
 app.get("/v1/arome/rain/latest", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT);
@@ -119,18 +135,40 @@ app.get("/v1/arome/rain/latest", async (req, res) => {
     const stamp = latestRunStamp(ids);
     if (!stamp) return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
 
-    // On ne garde que les IDs qui contiennent PRECIP (pour limiter)
     const precipIds = ids.filter((x) => x.includes("PRECIPITATION"));
     const rain = pickRainIds(precipIds, stamp);
 
-    res.json({
-      ok: true,
-      run,
-      latest_run_stamp: stamp,
-      rain
-    });
+    res.json({ ok: true, run, latest_run_stamp: stamp, rain });
   } catch (e) {
     res.status(500).json({ ok: false, error: "rain_latest_failed", message: String(e?.message || e) });
+  }
+});
+
+// ✅ Rafales latest
+app.get("/v1/arome/gust/latest", async (req, res) => {
+  try {
+    const run = String(req.query.run || RUN_DEFAULT);
+
+    const r = await fetch(capabilitiesUrl(run), {
+      headers: { apikey: process.env.AROME_APIKEY || "" }
+    });
+
+    const xml = await r.text();
+    if (!r.ok) {
+      return res.status(502).json({ ok: false, error: "mf_error", status: r.status, detail: xml.slice(0, 300) });
+    }
+
+    const ids = extractCoverageIds(xml);
+    const stamp = latestRunStamp(ids);
+    if (!stamp) return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
+
+    // on ne garde que les IDs gust pour être léger
+    const gustIds = ids.filter((x) => x.includes("GUST"));
+    const gust = pickGustIds(gustIds, stamp);
+
+    res.json({ ok: true, run, latest_run_stamp: stamp, gust });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "gust_latest_failed", message: String(e?.message || e) });
   }
 });
 
