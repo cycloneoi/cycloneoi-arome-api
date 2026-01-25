@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 8080;
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
 const RUN_DEFAULT = "001";
 
-// bbox Saint-Denis (petite zone)
+// bbox Saint-Denis
 const SDN = { lat: -20.8789, lon: 55.4481 };
 const BBOX = {
   longMin: SDN.lon - 0.08,
@@ -18,8 +18,10 @@ const BBOX = {
 function capabilitiesUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCapabilities?service=WCS&version=2.0.1&language=fre`;
 }
-function describeUrl(run) {
-  return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`;
+function describeUrl(run, coverageId) {
+  const u = new URL(`${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`);
+  u.searchParams.set("coverageId", coverageId);
+  return u.toString();
 }
 function getCoverageUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCoverage`;
@@ -63,13 +65,22 @@ function pickGustPt1h(ids, stamp) {
   ) || null;
 }
 
-// ---- DescribeCoverage parsing (doc MF) ----
+async function fetchText(url) {
+  const r = await fetch(url, {
+    headers: { apikey: process.env.AROME_APIKEY || "", accept: "application/xml,text/xml,*/*" }
+  });
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text };
+}
+
+// axisLabels="long lat height time"
 function parseAxisLabels(xml) {
   const m = xml.match(/axisLabels="([^"]+)"/);
-  if (!m) return null;
+  if (!m) return [];
   return m[1].trim().split(/\s+/);
 }
 
+// ✅ IMPORTANT: on récupère les coefficients du BON axe (height ou time)
 function parseCoefficientsForAxis(xml, axisName) {
   const re = new RegExp(
     `<gmlrgrid:gridAxesSpanned>\\s*${axisName}\\s*<\\/gmlrgrid:gridAxesSpanned>[\\s\\S]*?<gmlrgrid:coefficients>([\\s\\S]*?)<\\/gmlrgrid:coefficients>`,
@@ -80,25 +91,17 @@ function parseCoefficientsForAxis(xml, axisName) {
   return m[1].trim().split(/\s+/).filter(Boolean);
 }
 
-function firstNumeric(coeffs, fallback) {
-  if (!coeffs) return fallback;
-  for (const c of coeffs) {
-    const n = Number(c);
+function firstNumber(list, fallback) {
+  if (!list) return fallback;
+  for (const v of list) {
+    const n = Number(v);
     if (Number.isFinite(n)) return n;
   }
   return fallback;
 }
 
-async function fetchText(url) {
-  const r = await fetch(url, {
-    headers: { apikey: process.env.AROME_APIKEY || "", accept: "application/xml,text/xml,*/*" }
-  });
-  const text = await r.text();
-  return { ok: r.ok, status: r.status, text };
-}
-
 async function resolveCoverage(run, type) {
-  // 1) Capabilities -> find latest stamp + coverageId exact
+  // 1) Capabilities
   const cap = await fetchText(capabilitiesUrl(run));
   if (!cap.ok) return { ok: false, status: cap.status, error: "capabilities_failed", detail: cap.text.slice(0, 200) };
 
@@ -111,27 +114,20 @@ async function resolveCoverage(run, type) {
   if (type === "gust") coverageId = pickGustPt1h(ids, stamp);
   if (!coverageId) return { ok: false, status: 500, error: "coverage_not_found", stamp };
 
-  // 2) DescribeCoverage -> axisLabels + coefficients
-  const u = new URL(describeUrl(run));
-  u.searchParams.set("coverageId", coverageId);
-
-  const desc = await fetchText(u.toString());
+  // 2) DescribeCoverage
+  const desc = await fetchText(describeUrl(run, coverageId));
   if (!desc.ok) return { ok: false, status: desc.status, error: "describe_failed", coverageId, detail: desc.text.slice(0, 300) };
 
-  const axisLabels = parseAxisLabels(desc.text) || [];
-  const hasHeight = axisLabels.includes("height");
-
+  const axisLabels = parseAxisLabels(desc.text);
   const timeCoeffs = parseCoefficientsForAxis(desc.text, "time");
-  const heightCoeffs = hasHeight ? parseCoefficientsForAxis(desc.text, "height") : null;
+  const timeSeconds = firstNumber(timeCoeffs, 3600);
 
-  // MF doc: time en secondes => premier coeff (souvent 3600)
-  const timeSeconds = firstNumeric(timeCoeffs, 3600);
-
-  // MF doc: height discret => souvent 10
   let heightVal = null;
-  if (hasHeight) {
-    const nums = (heightCoeffs || []).map(x => Number(x)).filter(Number.isFinite);
-    heightVal = nums.includes(10) ? 10 : (nums[0] ?? 10);
+  if (axisLabels.includes("height")) {
+    const heightCoeffs = parseCoefficientsForAxis(desc.text, "height");
+    // doc + ton erreur: height must be in : 10
+    const h = firstNumber(heightCoeffs, 10);
+    heightVal = Number.isFinite(h) ? h : 10;
   }
 
   return { ok: true, stamp, coverageId, axisLabels, timeSeconds, heightVal };
@@ -142,33 +138,21 @@ async function doGetCoverage({ run, coverageId, timeSeconds, heightVal }) {
   u.searchParams.set("service", "WCS");
   u.searchParams.set("version", "2.0.1");
   u.searchParams.set("request", "GetCoverage");
-
-  // doc MF: coverageid (minuscule) dans l’exemple, on met les deux pour compat
+  // doc MF: coverageid (minuscule) recommandé
   u.searchParams.set("coverageid", coverageId);
-  u.searchParams.set("coverageId", coverageId);
-
-  // Reco: GeoTIFF
   u.searchParams.set("format", "image/tiff");
 
-  // Subsetting: long/lat peuvent avoir 2 valeurs (bbox)
   u.searchParams.append("subset", `long(${BBOX.longMin},${BBOX.longMax})`);
   u.searchParams.append("subset", `lat(${BBOX.latMin},${BBOX.latMax})`);
-
-  // Subsetting time: en secondes (coeff)
   u.searchParams.append("subset", `time(${timeSeconds})`);
 
-  // Height obligatoire si présent
   if (heightVal != null) {
     u.searchParams.append("subset", `height(${heightVal})`);
   }
 
-  const r = await fetch(u.toString(), {
-    headers: { apikey: process.env.AROME_APIKEY || "", accept: "*/*" }
-  });
-
+  const r = await fetch(u.toString(), { headers: { apikey: process.env.AROME_APIKEY || "", accept: "*/*" } });
   const buf = Buffer.from(await r.arrayBuffer());
   const ct = r.headers.get("content-type") || "application/octet-stream";
-
   return { status: r.status, ct, buf };
 }
 
@@ -178,7 +162,6 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
-// Garde le debug resolve (utile et prouve que ça marche)
 app.get("/v1/arome/debug/resolve", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
   const type = String(req.query.type || "rain");
@@ -186,10 +169,8 @@ app.get("/v1/arome/debug/resolve", async (req, res) => {
   res.status(out.ok ? 200 : (out.status || 500)).json(out);
 });
 
-// ✅ DOWNLOAD pluie PT1H (auto)
 app.get("/v1/arome/rain/download", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
-
   const info = await resolveCoverage(run, "rain");
   if (!info.ok) return res.status(info.status || 500).json(info);
 
@@ -207,18 +188,19 @@ app.get("/v1/arome/rain/download", async (req, res) => {
   res.send(out.buf);
 });
 
-// ✅ DOWNLOAD rafales PT1H (auto + height)
 app.get("/v1/arome/gust/download", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
-
   const info = await resolveCoverage(run, "gust");
   if (!info.ok) return res.status(info.status || 500).json(info);
+
+  // ✅ FORCÉ sur 10 si jamais le parse renvoie n'importe quoi (ce qui t'est arrivé)
+  const heightSafe = 10;
 
   const out = await doGetCoverage({
     run,
     coverageId: info.coverageId,
     timeSeconds: info.timeSeconds,
-    heightVal: info.heightVal
+    heightVal: heightSafe
   });
 
   res.status(out.status);
