@@ -3,9 +3,14 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// ===== CONFIG =====
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
 const RUN_DEFAULT = "001";
 
+// Change ce tag à chaque fois si tu veux vérifier un nouveau déploiement
+const BUILD_TAG = "v1.0.0-arome-latest-enabled";
+
+// ===== HELPERS =====
 function capabilitiesUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCapabilities?service=WCS&version=2.0.1&language=fre`;
 }
@@ -52,11 +57,27 @@ function pickCoverage(ids, stamp) {
   };
 }
 
+// ===== ROUTES =====
+
+// Home
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
+  res.json({
+    ok: true,
+    service: "CycloneOI AROME API",
+    status: "running"
+  });
 });
 
-// 1) Capabilities XML brut (déjà OK chez toi)
+// Version (preuve que c’est bien ce code qui tourne)
+app.get("/__version", (req, res) => {
+  res.json({
+    ok: true,
+    build: BUILD_TAG,
+    now: new Date().toISOString()
+  });
+});
+
+// 1) Capabilities XML brut (proxy)
 app.get("/v1/arome/capabilities", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT).trim();
@@ -75,7 +96,11 @@ app.get("/v1/arome/capabilities", async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(text);
   } catch (e) {
-    res.status(500).json({ ok: false, error: "capabilities_failed", message: String(e?.message || e) });
+    res.status(500).json({
+      ok: false,
+      error: "capabilities_failed",
+      message: String(e?.message || e)
+    });
   }
 });
 
@@ -93,13 +118,21 @@ app.get("/v1/arome/latest", async (req, res) => {
     });
 
     const xml = await r.text();
+
     if (!r.ok) {
-      return res.status(502).json({ ok: false, error: "mf_error", status: r.status, detail: xml.slice(0, 400) });
+      return res.status(502).json({
+        ok: false,
+        error: "mf_error",
+        status: r.status,
+        detail: xml.slice(0, 400)
+      });
     }
 
     const ids = extractCoverageIds(xml);
     const stamp = latestRunStamp(ids);
-    if (!stamp) return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
+    if (!stamp) {
+      return res.status(502).json({ ok: false, error: "no_run_stamp_found" });
+    }
 
     const coverage = pickCoverage(ids, stamp);
 
@@ -112,7 +145,11 @@ app.get("/v1/arome/latest", async (req, res) => {
       coverage
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "latest_failed", message: String(e?.message || e) });
+    res.status(500).json({
+      ok: false,
+      error: "latest_failed",
+      message: String(e?.message || e)
+    });
   }
 });
 
