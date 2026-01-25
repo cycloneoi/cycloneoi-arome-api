@@ -6,11 +6,11 @@ const PORT = process.env.PORT || 8080;
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
 const RUN_DEFAULT = "001";
 
-// bbox Saint-Denis
+// bbox Saint-Denis (petite zone)
 const SDN = { lat: -20.8789, lon: 55.4481 };
 const BBOX = {
-  lonMin: SDN.lon - 0.08,
-  lonMax: SDN.lon + 0.08,
+  longMin: SDN.lon - 0.08,
+  longMax: SDN.lon + 0.08,
   latMin: SDN.lat - 0.08,
   latMax: SDN.lat + 0.08,
 };
@@ -18,13 +18,15 @@ const BBOX = {
 function capabilitiesUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCapabilities?service=WCS&version=2.0.1&language=fre`;
 }
-
+function describeUrl(run, coverageId) {
+  const base = `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`;
+  const u = new URL(base);
+  // IMPORTANT: coverageId exact, URLSearchParams encode correctement
+  u.searchParams.set("coverageId", coverageId);
+  return u.toString();
+}
 function getCoverageBase(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCoverage`;
-}
-
-function describeBase(run) {
-  return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`;
 }
 
 function extractCoverageIds(xml) {
@@ -39,7 +41,7 @@ function latestRunStamp(ids) {
   let bestTs = null;
   let bestStr = null;
   for (const id of ids) {
-    const m = id.match(/__(\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}Z)/);
+    const m = id.match(/___(\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}Z)/) || id.match(/__(\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}Z)/);
     if (!m) continue;
     const iso = m[1].replace(/\./g, ":");
     const ts = Date.parse(iso);
@@ -52,152 +54,179 @@ function latestRunStamp(ids) {
   return bestStr;
 }
 
-function defaultValidTimeFromStamp(stamp) {
-  // le WCS refuse souvent 00Z, on force 01Z
-  const d = stamp.slice(0, 10);
-  return `${d}T01:00:00Z`;
+function pickRainPt1h(ids, stamp) {
+  // EXACT (issu des IDs)
+  return ids.find(x => x.startsWith("TOTAL_WATER_PRECIPITATION__GROUND_OR_WATER_SURFACE__") && x.includes(stamp) && x.endsWith("_PT1H")) || null;
+}
+function pickGustPt1h(ids, stamp) {
+  return ids.find(x => x.startsWith("WIND_SPEED_GUST") && x.includes(stamp) && x.endsWith("_PT1H")) || null;
 }
 
-function pickRainIds(ids, stamp) {
-  const byStamp = ids.filter((x) => x.includes(`__${stamp}_`));
-  const pick = (suffix) =>
-    byStamp.find((x) =>
-      x.startsWith("TOTAL_WATER_PRECIPITATION__GROUND_OR_WATER_SURFACE__") &&
-      x.endsWith(suffix)
-    ) || null;
-
-  return { pt1h: pick("_PT1H") };
-}
-
-function pickGustIds(ids, stamp) {
-  const byStamp = ids.filter((x) => x.includes(`__${stamp}_`));
-  const pick = (suffix) =>
-    byStamp.find((x) =>
-      x.startsWith("WIND_SPEED_GUST_MAX__") &&
-      x.endsWith(suffix)
-    ) || null;
-
-  return { pt1h: pick("_PT1H") };
-}
-
-async function fetchCapabilities(run) {
-  const r = await fetch(capabilitiesUrl(run), {
-    headers: { apikey: process.env.AROME_APIKEY || "" }
-  });
-  const xml = await r.text();
-  return { ok: r.ok, status: r.status, xml };
-}
-
-// ✅ DescribeCoverage corrigé : on URL-encode le coverageId correctement
-app.get("/v1/arome/describe", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const coverageId = String(req.query.coverageId || req.query.id || "");
-  if (!coverageId) return res.status(400).json({ ok: false, error: "coverageId_missing" });
-
-  const u = new URL(describeBase(run));
-  u.searchParams.set("coverageId", coverageId); // URLSearchParams encode correctement
-
-  const r = await fetch(u.toString(), {
+async function fetchText(url) {
+  const r = await fetch(url, {
     headers: { apikey: process.env.AROME_APIKEY || "", accept: "application/xml,text/xml,*/*" }
   });
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text };
+}
 
-  const xml = await r.text();
-  res.status(r.status);
-  res.setHeader("Content-Type", "application/xml; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.send(xml);
-});
+// ---- DescribeCoverage parsing (doc MF) ----
+// axisLabels="long lat height time" + coefficients pour chaque dimension discrete
+function parseAxisLabels(xml) {
+  const m = xml.match(/axisLabels="([^"]+)"/);
+  if (!m) return null;
+  return m[1].trim().split(/\s+/);
+}
+
+// coefficients associés à la dimension (ex: <gmlrgrid:gridAxesSpanned>time</...> puis <gmlrgrid:coefficients>3600 7200 ...</...>)
+function parseCoefficientsForAxis(xml, axisName) {
+  // on récupère le bloc du GeneralGridAxis correspondant à gridAxesSpanned=axisName
+  const re = new RegExp(`<gmlrgrid:gridAxesSpanned>\\s*${axisName}\\s*<\\/gmlrgrid:gridAxesSpanned>[\\s\\S]*?<gmlrgrid:coefficients>([\\s\\S]*?)<\\/gmlrgrid:coefficients>`, "i");
+  const m = xml.match(re);
+  if (!m) return null;
+  // split numbers/tokens
+  return m[1].trim().split(/\s+/).filter(Boolean);
+}
+
+function firstNumeric(coeffs) {
+  if (!coeffs) return null;
+  for (const c of coeffs) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+async function resolveCoverage(run, type) {
+  // type: "rain" or "gust"
+  const cap = await fetchText(capabilitiesUrl(run));
+  if (!cap.ok) return { ok: false, status: cap.status, error: "capabilities_failed", detail: cap.text.slice(0, 200) };
+
+  const ids = extractCoverageIds(cap.text);
+  const stamp = latestRunStamp(ids);
+  if (!stamp) return { ok: false, status: 500, error: "no_run_stamp_found" };
+
+  let coverageId = null;
+  if (type === "rain") coverageId = pickRainPt1h(ids, stamp);
+  if (type === "gust") coverageId = pickGustPt1h(ids, stamp);
+
+  if (!coverageId) return { ok: false, status: 500, error: "coverage_not_found", stamp };
+
+  // describe
+  const desc = await fetchText(describeUrl(run, coverageId));
+  if (!desc.ok) return { ok: false, status: desc.status, error: "describe_failed", coverageId, detail: desc.text.slice(0, 300) };
+
+  const axisLabels = parseAxisLabels(desc.text) || [];
+  // doc MF: long lat height time
+  const hasHeight = axisLabels.includes("height");
+
+  const timeCoeffs = parseCoefficientsForAxis(desc.text, "time");
+  const heightCoeffs = hasHeight ? parseCoefficientsForAxis(desc.text, "height") : null;
+
+  // Choix par défaut:
+  // - time: premier coefficient (souvent 3600)
+  // - height: 10 si dispo, sinon premier
+  const timeSeconds = firstNumeric(timeCoeffs) ?? 3600;
+
+  let heightVal = null;
+  if (hasHeight) {
+    const nums = (heightCoeffs || []).map(x => Number(x)).filter(Number.isFinite);
+    heightVal = nums.includes(10) ? 10 : (nums[0] ?? 10);
+  }
+
+  return {
+    ok: true,
+    stamp,
+    coverageId,
+    axisLabels,
+    timeSeconds,
+    heightVal
+  };
+}
+
+async function doGetCoverage({ run, coverageId, format, timeSeconds, heightVal }) {
+  const u = new URL(getCoverageBase(run));
+  u.searchParams.set("service", "WCS");
+  u.searchParams.set("version", "2.0.1");
+  u.searchParams.set("request", "GetCoverage");
+  // doc MF: coverageid (minuscule) dans l’exemple curl → on met les deux pour éviter les implémentations capricieuses
+  u.searchParams.set("coverageid", coverageId);
+  u.searchParams.set("coverageId", coverageId);
+  u.searchParams.set("format", format);
+
+  // doc MF: subset=dimensionA(val1[,val2])
+  u.searchParams.append("subset", `long(${BBOX.longMin},${BBOX.longMax})`);
+  u.searchParams.append("subset", `lat(${BBOX.latMin},${BBOX.latMax})`);
+  u.searchParams.append("subset", `time(${timeSeconds})`);
+
+  if (heightVal != null) {
+    u.searchParams.append("subset", `height(${heightVal})`);
+  }
+
+  const r = await fetch(u.toString(), { headers: { apikey: process.env.AROME_APIKEY || "", accept: "*/*" } });
+  const buf = Buffer.from(await r.arrayBuffer());
+  const ct = r.headers.get("content-type") || "application/octet-stream";
+  return { status: r.status, ct, buf, url: u.toString() };
+}
+
+// ===== ROUTES =====
 
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
-// Download pluie (par défaut pt1h + time valide) — axes: lon/lat/time (minuscules)
-app.get("/v1/arome/rain/download", async (req, res) => {
-  try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const format = String(req.query.format || "image/tiff");
-
-    const { ok, status, xml } = await fetchCapabilities(run);
-    if (!ok) return res.status(502).json({ ok: false, mf_status: status });
-
-    const ids = extractCoverageIds(xml);
-    const stamp = latestRunStamp(ids);
-    const timeIso = String(req.query.time || defaultValidTimeFromStamp(stamp));
-
-    // coverageId default pt1h
-    const rain = pickRainIds(ids.filter(x => x.includes("PRECIPITATION")), stamp);
-    const coverageId = String(req.query.coverageId || rain.pt1h || "");
-    if (!coverageId) return res.status(500).json({ ok: false, error: "no_rain_pt1h_found" });
-
-    const u = new URL(getCoverageBase(run));
-    u.searchParams.set("service", "WCS");
-    u.searchParams.set("version", "2.0.1");
-    u.searchParams.set("request", "GetCoverage");
-    u.searchParams.set("coverageId", coverageId);
-    u.searchParams.set("format", format);
-
-    // ✅ axes en minuscules
-    u.searchParams.append("subset", `lon(${BBOX.lonMin},${BBOX.lonMax})`);
-    u.searchParams.append("subset", `lat(${BBOX.latMin},${BBOX.latMax})`);
-    u.searchParams.append("subset", `time("${timeIso}")`);
-
-    const r = await fetch(u.toString(), { headers: { apikey: process.env.AROME_APIKEY || "" } });
-    const buf = Buffer.from(await r.arrayBuffer());
-    const ct = r.headers.get("content-type") || "application/octet-stream";
-
-    res.status(r.status);
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=600");
-    res.setHeader("Content-Type", ct);
-    res.send(buf);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: "rain_download_failed", message: String(e?.message || e) });
-  }
+// Debug: voir résolution (coverageId + timeSeconds + height)
+app.get("/v1/arome/debug/resolve", async (req, res) => {
+  const run = String(req.query.run || RUN_DEFAULT);
+  const type = String(req.query.type || "rain");
+  const out = await resolveCoverage(run, type);
+  res.status(out.ok ? 200 : (out.status || 500)).json(out);
 });
 
-// Download rafales (par défaut pt1h + time valide) — axes lon/lat/time + height(10)
+// Download pluie PT1H (auto)
+app.get("/v1/arome/rain/download", async (req, res) => {
+  const run = String(req.query.run || RUN_DEFAULT);
+  const format = String(req.query.format || "image/tiff");
+
+  const info = await resolveCoverage(run, "rain");
+  if (!info.ok) return res.status(info.status || 500).json(info);
+
+  const out = await doGetCoverage({
+    run,
+    coverageId: info.coverageId,
+    format,
+    timeSeconds: info.timeSeconds,
+    heightVal: null
+  });
+
+  res.status(out.status);
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "public, max-age=600");
+  res.setHeader("Content-Type", out.ct);
+  res.send(out.buf);
+});
+
+// Download rafales PT1H (auto + height)
 app.get("/v1/arome/gust/download", async (req, res) => {
-  try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const format = String(req.query.format || "image/tiff");
+  const run = String(req.query.run || RUN_DEFAULT);
+  const format = String(req.query.format || "image/tiff");
 
-    const { ok, status, xml } = await fetchCapabilities(run);
-    if (!ok) return res.status(502).json({ ok: false, mf_status: status });
+  const info = await resolveCoverage(run, "gust");
+  if (!info.ok) return res.status(info.status || 500).json(info);
 
-    const ids = extractCoverageIds(xml);
-    const stamp = latestRunStamp(ids);
-    const timeIso = String(req.query.time || defaultValidTimeFromStamp(stamp));
+  const out = await doGetCoverage({
+    run,
+    coverageId: info.coverageId,
+    format,
+    timeSeconds: info.timeSeconds,
+    heightVal: info.heightVal
+  });
 
-    const gust = pickGustIds(ids.filter(x => x.includes("GUST")), stamp);
-    const coverageId = String(req.query.coverageId || gust.pt1h || "");
-    if (!coverageId) return res.status(500).json({ ok: false, error: "no_gust_pt1h_found" });
-
-    const u = new URL(getCoverageBase(run));
-    u.searchParams.set("service", "WCS");
-    u.searchParams.set("version", "2.0.1");
-    u.searchParams.set("request", "GetCoverage");
-    u.searchParams.set("coverageId", coverageId);
-    u.searchParams.set("format", format);
-
-    u.searchParams.append("subset", `lon(${BBOX.lonMin},${BBOX.lonMax})`);
-    u.searchParams.append("subset", `lat(${BBOX.latMin},${BBOX.latMax})`);
-    u.searchParams.append("subset", `time("${timeIso}")`);
-    // ✅ height requis pour gust — valeur 10m
-    u.searchParams.append("subset", `height(${10})`);
-
-    const r = await fetch(u.toString(), { headers: { apikey: process.env.AROME_APIKEY || "" } });
-    const buf = Buffer.from(await r.arrayBuffer());
-    const ct = r.headers.get("content-type") || "application/octet-stream";
-
-    res.status(r.status);
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "public, max-age=600");
-    res.setHeader("Content-Type", ct);
-    res.send(buf);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: "gust_download_failed", message: String(e?.message || e) });
-  }
+  res.status(out.status);
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "public, max-age=600");
+  res.setHeader("Content-Type", out.ct);
+  res.send(out.buf);
 });
 
 app.listen(PORT, () => console.log("CycloneOI AROME API listening on", PORT));
