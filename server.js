@@ -1,4 +1,5 @@
 import express from "express";
+import { fromArrayBuffer } from "geotiff";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -6,22 +7,27 @@ const PORT = process.env.PORT || 8080;
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
 const RUN_DEFAULT = "001";
 
-// bbox Saint-Denis
-const SDN = { lat: -20.8789, lon: 55.4481 };
-const BBOX = {
-  longMin: SDN.lon - 0.08,
-  longMax: SDN.lon + 0.08,
-  latMin: SDN.lat - 0.08,
-  latMax: SDN.lat + 0.08,
-};
+// Point ville (Saint-Denis)
+const CITY = { lat: -20.8789, lon: 55.4481 };
+
+// bbox (WCS) : on garde une bbox "petite" autour de la ville
+// NOTE: 5 km ~ 0.045° en latitude ; en longitude dépend de la latitude (~0.048° à -21°)
+function bboxFromRadiusKm(lat, lon, rKm) {
+  const dLat = rKm / 111.0;
+  const dLon = rKm / (111.0 * Math.cos((Math.abs(lat) * Math.PI) / 180));
+  return {
+    longMin: lon - dLon,
+    longMax: lon + dLon,
+    latMin: lat - dLat,
+    latMax: lat + dLat
+  };
+}
 
 function capabilitiesUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCapabilities?service=WCS&version=2.0.1&language=fre`;
 }
-function describeUrl(run, coverageId) {
-  const u = new URL(`${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`);
-  u.searchParams.set("coverageId", coverageId);
-  return u.toString();
+function describeUrl(run) {
+  return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/DescribeCoverage?service=WCS&version=2.0.1`;
 }
 function getCoverageUrl(run) {
   return `${MF_BASE}wcs/MF-NWP-HIGHRES-PEARO${run}-OM-0025-INDIEN-WCS/GetCoverage`;
@@ -80,7 +86,6 @@ function parseAxisLabels(xml) {
   return m[1].trim().split(/\s+/);
 }
 
-// ✅ IMPORTANT: on récupère les coefficients du BON axe (height ou time)
 function parseCoefficientsForAxis(xml, axisName) {
   const re = new RegExp(
     `<gmlrgrid:gridAxesSpanned>\\s*${axisName}\\s*<\\/gmlrgrid:gridAxesSpanned>[\\s\\S]*?<gmlrgrid:coefficients>([\\s\\S]*?)<\\/gmlrgrid:coefficients>`,
@@ -100,23 +105,23 @@ function firstNumber(list, fallback) {
   return fallback;
 }
 
-async function resolveCoverage(run, type) {
-  // 1) Capabilities
+async function resolve(run, type) {
   const cap = await fetchText(capabilitiesUrl(run));
-  if (!cap.ok) return { ok: false, status: cap.status, error: "capabilities_failed", detail: cap.text.slice(0, 200) };
+  if (!cap.ok) return { ok:false, status: cap.status, error:"capabilities_failed", detail: cap.text.slice(0,200) };
 
   const ids = extractCoverageIds(cap.text);
   const stamp = latestRunStamp(ids);
-  if (!stamp) return { ok: false, status: 500, error: "no_run_stamp_found" };
+  if (!stamp) return { ok:false, status:500, error:"no_run_stamp_found" };
 
   let coverageId = null;
   if (type === "rain") coverageId = pickRainPt1h(ids, stamp);
   if (type === "gust") coverageId = pickGustPt1h(ids, stamp);
-  if (!coverageId) return { ok: false, status: 500, error: "coverage_not_found", stamp };
+  if (!coverageId) return { ok:false, status:500, error:"coverage_not_found", stamp };
 
-  // 2) DescribeCoverage
-  const desc = await fetchText(describeUrl(run, coverageId));
-  if (!desc.ok) return { ok: false, status: desc.status, error: "describe_failed", coverageId, detail: desc.text.slice(0, 300) };
+  const du = new URL(describeUrl(run));
+  du.searchParams.set("coverageId", coverageId);
+  const desc = await fetchText(du.toString());
+  if (!desc.ok) return { ok:false, status: desc.status, error:"describe_failed", coverageId, detail: desc.text.slice(0,300) };
 
   const axisLabels = parseAxisLabels(desc.text);
   const timeCoeffs = parseCoefficientsForAxis(desc.text, "time");
@@ -125,35 +130,59 @@ async function resolveCoverage(run, type) {
   let heightVal = null;
   if (axisLabels.includes("height")) {
     const heightCoeffs = parseCoefficientsForAxis(desc.text, "height");
-    // doc + ton erreur: height must be in : 10
-    const h = firstNumber(heightCoeffs, 10);
-    heightVal = Number.isFinite(h) ? h : 10;
+    // ton service: uniquement 10
+    heightVal = 10;
+    // (on force, car tu as déjà prouvé que c’est ce que MF exige)
+    const _h = firstNumber(heightCoeffs, 10);
+    if (Number.isFinite(_h)) heightVal = 10;
   }
 
-  return { ok: true, stamp, coverageId, axisLabels, timeSeconds, heightVal };
+  return { ok:true, stamp, coverageId, timeSeconds, heightVal, axisLabels };
 }
 
-async function doGetCoverage({ run, coverageId, timeSeconds, heightVal }) {
+async function getCoverageTiff({ run, coverageId, timeSeconds, heightVal, bbox }) {
   const u = new URL(getCoverageUrl(run));
-  u.searchParams.set("service", "WCS");
-  u.searchParams.set("version", "2.0.1");
-  u.searchParams.set("request", "GetCoverage");
-  // doc MF: coverageid (minuscule) recommandé
+  u.searchParams.set("service","WCS");
+  u.searchParams.set("version","2.0.1");
+  u.searchParams.set("request","GetCoverage");
   u.searchParams.set("coverageid", coverageId);
   u.searchParams.set("format", "image/tiff");
 
-  u.searchParams.append("subset", `long(${BBOX.longMin},${BBOX.longMax})`);
-  u.searchParams.append("subset", `lat(${BBOX.latMin},${BBOX.latMax})`);
+  u.searchParams.append("subset", `long(${bbox.longMin},${bbox.longMax})`);
+  u.searchParams.append("subset", `lat(${bbox.latMin},${bbox.latMax})`);
   u.searchParams.append("subset", `time(${timeSeconds})`);
-
-  if (heightVal != null) {
-    u.searchParams.append("subset", `height(${heightVal})`);
-  }
+  if (heightVal != null) u.searchParams.append("subset", `height(${heightVal})`);
 
   const r = await fetch(u.toString(), { headers: { apikey: process.env.AROME_APIKEY || "", accept: "*/*" } });
-  const buf = Buffer.from(await r.arrayBuffer());
+  const buf = await r.arrayBuffer();
   const ct = r.headers.get("content-type") || "application/octet-stream";
   return { status: r.status, ct, buf };
+}
+
+// lit un GeoTIFF et renvoie le max d’une grille d’échantillonnage 5x5 dans la bbox
+async function maxFromGeoTiff(arrayBuffer) {
+  const tiff = await fromArrayBuffer(arrayBuffer);
+  const image = await tiff.getImage();
+  const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
+  const width = image.getWidth();
+  const height = image.getHeight();
+
+  // lecture raster complète serait lourde; on échantillonne 5x5
+  const samples = 5;
+  let max = -Infinity;
+
+  for (let yi = 0; yi < samples; yi++) {
+    for (let xi = 0; xi < samples; xi++) {
+      const x = Math.round((xi / (samples - 1)) * (width - 1));
+      const y = Math.round((yi / (samples - 1)) * (height - 1));
+      const ras = await image.readRasters({ window: [x, y, x + 1, y + 1] });
+      const v = ras?.[0]?.[0];
+      if (Number.isFinite(v)) max = Math.max(max, v);
+    }
+  }
+
+  if (!Number.isFinite(max)) return null;
+  return max;
 }
 
 // ===== ROUTES =====
@@ -162,52 +191,93 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
+// debug resolve (utile)
 app.get("/v1/arome/debug/resolve", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
   const type = String(req.query.type || "rain");
-  const out = await resolveCoverage(run, type);
+  const out = await resolve(run, type);
   res.status(out.ok ? 200 : (out.status || 500)).json(out);
 });
 
+// download TIFF (comme avant)
 app.get("/v1/arome/rain/download", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
-  const info = await resolveCoverage(run, "rain");
+  const info = await resolve(run, "rain");
   if (!info.ok) return res.status(info.status || 500).json(info);
 
-  const out = await doGetCoverage({
-    run,
-    coverageId: info.coverageId,
-    timeSeconds: info.timeSeconds,
-    heightVal: null
-  });
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const out = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: null, bbox });
 
   res.status(out.status);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "public, max-age=600");
   res.setHeader("Content-Type", out.ct);
-  res.send(out.buf);
+  res.send(Buffer.from(out.buf));
 });
 
 app.get("/v1/arome/gust/download", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
-  const info = await resolveCoverage(run, "gust");
+  const info = await resolve(run, "gust");
   if (!info.ok) return res.status(info.status || 500).json(info);
 
-  // ✅ FORCÉ sur 10 si jamais le parse renvoie n'importe quoi (ce qui t'est arrivé)
-  const heightSafe = 10;
-
-  const out = await doGetCoverage({
-    run,
-    coverageId: info.coverageId,
-    timeSeconds: info.timeSeconds,
-    heightVal: heightSafe
-  });
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const out = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: 10, bbox });
 
   res.status(out.status);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "public, max-age=600");
   res.setHeader("Content-Type", out.ct);
-  res.send(out.buf);
+  res.send(Buffer.from(out.buf));
+});
+
+// ✅ NOUVEAU : valeur locale (max) sur bbox 5 km
+app.get("/v1/arome/rain/value", async (req, res) => {
+  const run = String(req.query.run || RUN_DEFAULT);
+  const info = await resolve(run, "rain");
+  if (!info.ok) return res.status(info.status || 500).json(info);
+
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const cov = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: null, bbox });
+
+  if (cov.status < 200 || cov.status >= 300) {
+    return res.status(cov.status).json({ ok:false, error:"download_failed", status: cov.status });
+  }
+
+  const maxVal = await maxFromGeoTiff(cov.buf);
+  res.json({
+    ok: true,
+    type: "rain",
+    run,
+    coverageId: info.coverageId,
+    timeSeconds: info.timeSeconds,
+    radius_km: 5,
+    max_mm: maxVal
+  });
+});
+
+app.get("/v1/arome/gust/value", async (req, res) => {
+  const run = String(req.query.run || RUN_DEFAULT);
+  const info = await resolve(run, "gust");
+  if (!info.ok) return res.status(info.status || 500).json(info);
+
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const cov = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: 10, bbox });
+
+  if (cov.status < 200 || cov.status >= 300) {
+    return res.status(cov.status).json({ ok:false, error:"download_failed", status: cov.status });
+  }
+
+  const maxVal = await maxFromGeoTiff(cov.buf);
+  res.json({
+    ok: true,
+    type: "gust",
+    run,
+    coverageId: info.coverageId,
+    timeSeconds: info.timeSeconds,
+    height: 10,
+    radius_km: 5,
+    max_value: maxVal
+  });
 });
 
 app.listen(PORT, () => console.log("CycloneOI AROME API listening on", PORT));
