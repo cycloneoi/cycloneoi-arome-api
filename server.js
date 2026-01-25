@@ -3,20 +3,14 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ----- Config -----
 const MF_BASE = "https://public-api.meteofrance.fr/public/pearome/1.0/";
-const RUN_DEFAULT = "001"; // membre 001 (comme tes tests)
+const RUN_DEFAULT = "001";
 
-// ----- Health -----
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "CycloneOI AROME API",
-    status: "running"
-  });
+  res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
-// ----- AROME: GetCapabilities (XML brut) -----
+// 1) Proxy GetCapabilities (XML brut)
 app.get("/v1/arome/capabilities", async (req, res) => {
   try {
     const run = String(req.query.run || RUN_DEFAULT).trim();
@@ -27,28 +21,19 @@ app.get("/v1/arome/capabilities", async (req, res) => {
 
     const r = await fetch(url, {
       headers: {
-        // ta clé est dans les variables d'environnement Fly
         apikey: process.env.AROME_APIKEY || "",
         accept: "application/xml,text/xml,*/*"
       }
     });
 
     const text = await r.text();
-
     res.status(r.status);
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
-    // CORS (pratique pour tester au navigateur)
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(text);
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "capabilities_failed",
-      message: String(e?.message || e)
-    });
+    res.status(500).json({ ok: false, error: "capabilities_failed", message: String(e?.message || e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
-});
+app.listen(PORT, () => console.log("Server listening on port", PORT));
