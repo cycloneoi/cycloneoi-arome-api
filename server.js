@@ -10,7 +10,7 @@ const RUN_DEFAULT = "001";
 // Point ville (Saint-Denis)
 const CITY = { lat: -20.8789, lon: 55.4481 };
 
-// bbox (WCS) : on garde une bbox "petite" autour de la ville
+// bbox (WCS) : bbox autour de la ville
 // NOTE: 5 km ~ 0.045° en latitude ; en longitude dépend de la latitude (~0.048° à -21°)
 function bboxFromRadiusKm(lat, lon, rKm) {
   const dLat = rKm / 111.0;
@@ -132,7 +132,6 @@ async function resolve(run, type) {
     const heightCoeffs = parseCoefficientsForAxis(desc.text, "height");
     // ton service: uniquement 10
     heightVal = 10;
-    // (on force, car tu as déjà prouvé que c’est ce que MF exige)
     const _h = firstNumber(heightCoeffs, 10);
     if (Number.isFinite(_h)) heightVal = 10;
   }
@@ -159,15 +158,13 @@ async function getCoverageTiff({ run, coverageId, timeSeconds, heightVal, bbox }
   return { status: r.status, ct, buf };
 }
 
-// lit un GeoTIFF et renvoie le max d’une grille d’échantillonnage 5x5 dans la bbox
+// lit un GeoTIFF et renvoie le max d’une grille d’échantillonnage 5x5
 async function maxFromGeoTiff(arrayBuffer) {
   const tiff = await fromArrayBuffer(arrayBuffer);
   const image = await tiff.getImage();
-  const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
   const width = image.getWidth();
   const height = image.getHeight();
 
-  // lecture raster complète serait lourde; on échantillonne 5x5
   const samples = 5;
   let max = -Infinity;
 
@@ -191,7 +188,7 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "CycloneOI AROME API", status: "running" });
 });
 
-// debug resolve (utile)
+// debug resolve
 app.get("/v1/arome/debug/resolve", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
   const type = String(req.query.type || "rain");
@@ -199,7 +196,7 @@ app.get("/v1/arome/debug/resolve", async (req, res) => {
   res.status(out.ok ? 200 : (out.status || 500)).json(out);
 });
 
-// download TIFF (comme avant)
+// download TIFF (bbox 5km)
 app.get("/v1/arome/rain/download", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
   const info = await resolve(run, "rain");
@@ -230,13 +227,14 @@ app.get("/v1/arome/gust/download", async (req, res) => {
   res.send(Buffer.from(out.buf));
 });
 
-// ✅ NOUVEAU : valeur locale (max) sur bbox 5 km
+// valeur locale (max) sur bbox 5 km
 app.get("/v1/arome/rain/value", async (req, res) => {
   const run = String(req.query.run || RUN_DEFAULT);
   const info = await resolve(run, "rain");
   if (!info.ok) return res.status(info.status || 500).json(info);
 
-  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const radiusKm = Math.max(1, Math.min(10, parseFloat(req.query.radius_km || "5") || 5));
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, radiusKm);
   const cov = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: null, bbox });
 
   if (cov.status < 200 || cov.status >= 300) {
@@ -250,7 +248,7 @@ app.get("/v1/arome/rain/value", async (req, res) => {
     run,
     coverageId: info.coverageId,
     timeSeconds: info.timeSeconds,
-    radius_km: 5,
+    radius_km: radiusKm,
     max_mm: maxVal
   });
 });
@@ -260,7 +258,8 @@ app.get("/v1/arome/gust/value", async (req, res) => {
   const info = await resolve(run, "gust");
   if (!info.ok) return res.status(info.status || 500).json(info);
 
-  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, 5);
+  const radiusKm = Math.max(1, Math.min(10, parseFloat(req.query.radius_km || "5") || 5));
+  const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, radiusKm);
   const cov = await getCoverageTiff({ run, coverageId: info.coverageId, timeSeconds: info.timeSeconds, heightVal: 10, bbox });
 
   if (cov.status < 200 || cov.status >= 300) {
@@ -275,9 +274,117 @@ app.get("/v1/arome/gust/value", async (req, res) => {
     coverageId: info.coverageId,
     timeSeconds: info.timeSeconds,
     height: 10,
-    radius_km: 5,
-    max_value: maxVal
+    radius_km: radiusKm,
+    max_value: maxVal,
+    max_kmh: (Number.isFinite(maxVal) ? maxVal * 3.6 : null)
   });
+});
+
+// ✅ NOUVEAU : SERIES 0–48h (ou param hours) — max bbox
+app.get("/v1/arome/rain/series", async (req, res) => {
+  try {
+    const run = String(req.query.run || RUN_DEFAULT);
+    const hours = Math.max(1, Math.min(48, parseInt(req.query.hours || "48", 10) || 48));
+    const radiusKm = Math.max(1, Math.min(10, parseFloat(req.query.radius_km || "5") || 5));
+
+    const info = await resolve(run, "rain");
+    if (!info.ok) return res.status(info.status || 500).json(info);
+
+    const step = Number(info.timeSeconds); // 3600
+    const steps = Math.floor((hours * 3600) / step);
+
+    const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, radiusKm);
+
+    const series = [];
+    for (let i = 1; i <= steps; i++) {
+      const tSec = i * step;
+
+      const cov = await getCoverageTiff({
+        run,
+        coverageId: info.coverageId,
+        timeSeconds: tSec,
+        heightVal: null,
+        bbox
+      });
+
+      if (cov.status < 200 || cov.status >= 300) {
+        series.push({ t_seconds: tSec, ok: false, error: `download_${cov.status}` });
+        continue;
+      }
+
+      const maxVal = await maxFromGeoTiff(cov.buf);
+      series.push({ t_seconds: tSec, ok: true, max_mm: maxVal });
+    }
+
+    res.json({
+      ok: true,
+      type: "rain",
+      run,
+      coverageId: info.coverageId,
+      step_seconds: step,
+      hours,
+      radius_km: radiusKm,
+      series
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "rain_series_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/gust/series", async (req, res) => {
+  try {
+    const run = String(req.query.run || RUN_DEFAULT);
+    const hours = Math.max(1, Math.min(48, parseInt(req.query.hours || "48", 10) || 48));
+    const radiusKm = Math.max(1, Math.min(10, parseFloat(req.query.radius_km || "5") || 5));
+
+    const info = await resolve(run, "gust");
+    if (!info.ok) return res.status(info.status || 500).json(info);
+
+    const step = Number(info.timeSeconds); // 3600
+    const steps = Math.floor((hours * 3600) / step);
+
+    const bbox = bboxFromRadiusKm(CITY.lat, CITY.lon, radiusKm);
+
+    const series = [];
+    for (let i = 1; i <= steps; i++) {
+      const tSec = i * step;
+
+      const cov = await getCoverageTiff({
+        run,
+        coverageId: info.coverageId,
+        timeSeconds: tSec,
+        heightVal: 10,
+        bbox
+      });
+
+      if (cov.status < 200 || cov.status >= 300) {
+        series.push({ t_seconds: tSec, ok: false, error: `download_${cov.status}` });
+        continue;
+      }
+
+      const maxVal = await maxFromGeoTiff(cov.buf); // probable m/s
+      series.push({
+        t_seconds: tSec,
+        ok: true,
+        max_ms: maxVal,
+        max_kmh: (Number.isFinite(maxVal) ? maxVal * 3.6 : null)
+      });
+    }
+
+    res.json({
+      ok: true,
+      type: "gust",
+      run,
+      coverageId: info.coverageId,
+      height: 10,
+      step_seconds: step,
+      hours,
+      radius_km: radiusKm,
+      series
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "gust_series_failed", message: String(e?.message || e) });
+  }
 });
 
 app.listen(PORT, () => console.log("CycloneOI AROME API listening on", PORT));
