@@ -38,16 +38,20 @@ let placesCache = {
 // ========================================================
 
 // Adapte ces URLs si ton endpoint WCS réel diffère
+const MF_WCS_BASE =
+  process.env.MF_WCS_BASE ||
+  "https://public-api.meteofrance.fr/public/arome/1.0/wcs";
+
 function capabilitiesUrl(run) {
-  return `https://public-api.meteofrance.fr/public/arome/1.0/wcs/METADATA?service=WCS&version=2.0.1&request=GetCapabilities`;
+  return `${MF_WCS_BASE}?service=WCS&version=2.0.1&request=GetCapabilities`;
 }
 
 function describeUrl(run) {
-  return `https://public-api.meteofrance.fr/public/arome/1.0/wcs/METADATA?service=WCS&version=2.0.1&request=DescribeCoverage`;
+  return `${MF_WCS_BASE}?service=WCS&version=2.0.1&request=DescribeCoverage`;
 }
 
 function getCoverageUrl(run) {
-  return `https://public-api.meteofrance.fr/public/arome/1.0/wcs/METADATA`;
+  return MF_WCS_BASE;
 }
 
 // ========================================================
