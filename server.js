@@ -332,7 +332,8 @@ async function autoPickPackage(grid) {
       const m = href.match(/\/packages\/([^/]+)$/);
       return m ? decodeURIComponent(m[1]) : null;
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((x) => x !== "packages");
 
   if (!packages.length) {
     return { ok: false, error: "package_parse_failed", raw: links };
