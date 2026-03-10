@@ -1,32 +1,28 @@
 import express from "express";
-import { fromArrayBuffer } from "geotiff";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ========================================================
-// CONFIG GÉNÉRALE
+// CONFIG
 // ========================================================
 
-const RUN_DEFAULT = "001";
-const DEFAULT_RADIUS_KM = 5;
-const MAX_RADIUS_KM = 10;
-const DEFAULT_HOURS = 48;
-const MAX_HOURS = 48;
+const MF_BASE =
+  process.env.MF_BASE ||
+  "https://public-api.meteofrance.fr/previnum/DPPaquetAROME-OM/v1";
 
-// Fallback historique si aucun city/lat/lon n'est fourni
-const FALLBACK_POINT = {
-  slug: "saint-denis",
-  label: "Saint Denis",
-  lat: -20.8789,
-  lon: 55.4481,
-};
+const MF_MODEL = "AROME-OM-INDIEN";
+const MF_PRODUCT_ID = "productOMOI";
 
-// Source des lieux depuis ton worker premium
+// Auth: swagger = security OAuth2.
+// En pratique on envoie un Bearer si dispo.
+// Si ton infra utilisait encore une clé simple, on garde aussi un fallback apikey.
+const MF_BEARER_TOKEN = process.env.MF_BEARER_TOKEN || "";
+const MF_APIKEY = process.env.AROME_APIKEY || process.env.MF_APIKEY || "";
+
 const PLACES_SOURCE_URL =
   "https://cycloneoi-premium.patrick-rabeson.workers.dev/v1/locations?resolve=1";
-
-const PLACES_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const PLACES_TTL_MS = 6 * 60 * 60 * 1000;
 
 let placesCache = {
   ts: 0,
@@ -34,241 +30,7 @@ let placesCache = {
 };
 
 // ========================================================
-// URLS WCS AROME
-// ========================================================
-
-// Adapte ces URLs si ton endpoint WCS réel diffère
-const MF_WCS_BASE =
-  process.env.MF_WCS_BASE ||
-  "https://public-api.meteofrance.fr/public/arome/1.0/wcs";
-
-function capabilitiesUrl(run) {
-  return `${MF_WCS_BASE}?service=WCS&version=2.0.1&request=GetCapabilities`;
-}
-
-function describeUrl(run) {
-  return `${MF_WCS_BASE}?service=WCS&version=2.0.1&request=DescribeCoverage`;
-}
-
-function getCoverageUrl(run) {
-  return MF_WCS_BASE;
-}
-
-// ========================================================
-// VARIABLES AROME
-// ========================================================
-
-const AROME_VARIABLES = {
-  rain: {
-    aliases: ["rain", "precipitation"],
-    candidates: [
-      {
-        startsWith: "TOTAL_WATER_PRECIPITATION__GROUND_OR_WATER_SURFACE__",
-        endsWith: "_PT1H",
-      },
-      {
-        startsWith: "TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "max",
-    responseKey: "max_mm",
-    unit: "mm",
-    defaultHeight: null,
-  },
-
-  precip_rate: {
-    aliases: ["precip_rate"],
-    candidates: [
-      {
-        startsWith: "TOTAL_PRECIPITATION_RATE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "max",
-    responseKey: "max_mmh",
-    unit: "mm/h",
-    defaultHeight: 2,
-  },
-
-  gust: {
-    aliases: ["gust", "wind_gust", "wind_gusts"],
-    candidates: [
-      {
-        startsWith: "WIND_SPEED_GUST_MAX__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-      {
-        startsWith: "WIND_SPEED_GUST__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "max",
-    responseKey: "max_ms",
-    unit: "m/s",
-    defaultHeight: 10,
-    postProcess: (v) => ({
-      max_ms: v,
-      max_kmh: Number.isFinite(v) ? v * 3.6 : null,
-    }),
-  },
-
-  wind_speed: {
-    aliases: ["wind_speed", "wind"],
-    candidates: [
-      {
-        startsWith: "WIND_SPEED__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_ms",
-    unit: "m/s",
-    defaultHeight: 10,
-    postProcess: (v) => ({
-      value_ms: v,
-      value_kmh: Number.isFinite(v) ? v * 3.6 : null,
-    }),
-  },
-
-  wind_dir: {
-    aliases: ["wind_dir", "wind_direction", "direction"],
-    candidates: [
-      {
-        startsWith: "WIND__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-      {
-        startsWith: "WIND_DIRECTION__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_deg",
-    unit: "deg",
-    defaultHeight: 10,
-  },
-
-  rh: {
-    aliases: ["rh", "humidity", "relative_humidity"],
-    candidates: [
-      {
-        startsWith: "RELATIVE_HUMIDITY__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_percent",
-    unit: "%",
-    defaultHeight: 2,
-  },
-
-  temp: {
-    aliases: ["temp", "temperature"],
-    candidates: [
-      {
-        startsWith: "TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_c",
-    unit: "°C",
-    defaultHeight: 2,
-    convert: "k_to_c",
-  },
-
-  temp_min: {
-    aliases: ["temp_min", "minimum_temperature"],
-    candidates: [
-      {
-        startsWith: "MINIMUM_TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "min",
-    responseKey: "value_c",
-    unit: "°C",
-    defaultHeight: 2,
-    convert: "k_to_c",
-  },
-
-  dewpoint: {
-    aliases: ["dewpoint", "dew_point"],
-    candidates: [
-      {
-        startsWith: "DEW_POINT_TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_c",
-    unit: "°C",
-    defaultHeight: 2,
-    convert: "k_to_c",
-  },
-
-  pressure: {
-    aliases: ["pressure", "pressure_msl"],
-    candidates: [
-      {
-        startsWith: "PRESSURE__MEAN_SEA_LEVEL__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_hpa",
-    unit: "hPa",
-    defaultHeight: null,
-    convert: "pa_to_hpa",
-  },
-
-  soil_temp: {
-    aliases: ["soil_temp", "ground_temperature", "surface_temperature"],
-    candidates: [
-      {
-        startsWith: "TEMPERATURE__GROUND_OR_WATER_SURFACE__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "mean",
-    responseKey: "value_c",
-    unit: "°C",
-    defaultHeight: null,
-    convert: "k_to_c",
-  },
-
-  lightning: {
-    aliases: ["lightning", "lightning_density"],
-    candidates: [
-      {
-        startsWith: "LIGHTNING_STRIKE_DENSITY__GROUND_OR_WATER_SURFACE__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "max",
-    responseKey: "value",
-    unit: "strikes/km²",
-    defaultHeight: null,
-  },
-
-  cape: {
-    aliases: ["cape"],
-    candidates: [
-      {
-        startsWith: "CONVECTIVE_AVAILABLE_POTENTIAL_ENERGY__GROUND_OR_WATER_SURFACE__",
-        endsWith: "_PT1H",
-      },
-    ],
-    reducer: "max",
-    responseKey: "value_jkg",
-    unit: "J/kg",
-    defaultHeight: null,
-  },
-};
-
-// ========================================================
-// HELPERS GÉNÉRAUX
+// HELPERS
 // ========================================================
 
 function cors(res) {
@@ -290,40 +52,52 @@ function normalizeSlug(s) {
   return String(s || "").trim().toLowerCase();
 }
 
-function normalizeVariableName(raw) {
-  const q = String(raw || "").trim().toLowerCase();
-  if (!q) return null;
+function isoUtcNoMs(d) {
+  return new Date(d).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
 
-  for (const [key, cfg] of Object.entries(AROME_VARIABLES)) {
-    if (key === q) return key;
-    if ((cfg.aliases || []).includes(q)) return key;
+function hourTokenFromInt(h) {
+  const n = clamp(parseInt(String(h || 0), 10) || 0, 0, 999);
+  return `${String(n).padStart(3, "0")}H`;
+}
+
+function buildMfHeaders(accept = "application/json") {
+  const headers = { accept };
+  if (MF_BEARER_TOKEN) headers.Authorization = `Bearer ${MF_BEARER_TOKEN}`;
+  if (MF_APIKEY) headers.apikey = MF_APIKEY;
+  return headers;
+}
+
+async function fetchJson(url) {
+  const r = await fetch(url, { headers: buildMfHeaders("application/json,text/json,*/*") });
+  const text = await r.text();
+
+  if (!r.ok) {
+    throw new Error(`upstream_${r.status}: ${text.slice(0, 500)}`);
   }
-  return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`json_parse_failed: ${text.slice(0, 500)}`);
+  }
 }
 
-function kmToLatDeg(km) {
-  return km / 111.32;
-}
+async function fetchBuffer(url) {
+  const r = await fetch(url, { headers: buildMfHeaders("*/*") });
+  const buf = await r.arrayBuffer();
+  const ct = r.headers.get("content-type") || "application/octet-stream";
 
-function kmToLonDeg(km, latDeg) {
-  const c = Math.cos((latDeg * Math.PI) / 180);
-  const safe = Math.max(Math.abs(c), 0.05);
-  return km / (111.32 * safe);
-}
+  if (!r.ok) {
+    const text = new TextDecoder().decode(buf).slice(0, 500);
+    throw new Error(`upstream_${r.status}: ${text}`);
+  }
 
-function bboxFromRadiusKm(lat, lon, radiusKm) {
-  const dLat = kmToLatDeg(radiusKm);
-  const dLon = kmToLonDeg(radiusKm, lat);
-  return {
-    longMin: lon - dLon,
-    longMax: lon + dLon,
-    latMin: lat - dLat,
-    latMax: lat + dLat,
-  };
+  return { buf, ct };
 }
 
 // ========================================================
-// LIEUX DEPUIS LE WORKER PREMIUM
+// LIEUX
 // ========================================================
 
 async function loadPlaces() {
@@ -382,42 +156,22 @@ async function loadPlaces() {
         label: p.label || p.name || p.slug,
         lat,
         lon,
-        raw: p,
       };
     })
-    .filter(
-      (p) =>
-        p.slug &&
-        Number.isFinite(p.lat) &&
-        Number.isFinite(p.lon)
-    );
+    .filter((p) => p.slug && Number.isFinite(p.lat) && Number.isFinite(p.lon));
 
   if (!places.length) {
-    console.log("DEBUG places payload:", JSON.stringify(rawPlaces.slice(0, 3), null, 2));
     throw new Error("places_empty_or_no_coordinates");
   }
 
-  placesCache = {
-    ts: now,
-    data: places,
-  };
-
+  placesCache = { ts: now, data: places };
   return places;
 }
 
 async function resolvePlaceFromCity(city) {
   const places = await loadPlaces();
   const slug = normalizeSlug(city);
-
-  const place = places.find((p) => normalizeSlug(p.slug) === slug) || null;
-  if (!place) return null;
-
-  return {
-    slug: place.slug,
-    label: place.label,
-    lat: place.lat,
-    lon: place.lon,
-  };
+  return places.find((p) => normalizeSlug(p.slug) === slug) || null;
 }
 
 async function getPoint(req) {
@@ -425,9 +179,7 @@ async function getPoint(req) {
 
   if (city) {
     const place = await resolvePlaceFromCity(city);
-    if (!place) {
-      throw new Error(`unknown_city_${city}`);
-    }
+    if (!place) throw new Error(`unknown_city_${city}`);
     return {
       source: "city",
       city: place.slug,
@@ -437,8 +189,12 @@ async function getPoint(req) {
     };
   }
 
-  const lat = parseNum(req.query.lat, FALLBACK_POINT.lat);
-  const lon = parseNum(req.query.lon, FALLBACK_POINT.lon);
+  const lat = parseNum(req.query.lat, null);
+  const lon = parseNum(req.query.lon, null);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("missing_city_or_latlon");
+  }
 
   return {
     source: "latlon",
@@ -450,373 +206,157 @@ async function getPoint(req) {
 }
 
 // ========================================================
-// WCS HELPERS
+// MFR API URLS
 // ========================================================
 
-async function fetchText(url) {
-  const r = await fetch(url, {
-    headers: {
-      apikey: process.env.AROME_APIKEY || "",
-      accept: "application/xml,text/xml,*/*",
-    },
-  });
-
-  const text = await r.text();
-  return { ok: r.ok, status: r.status, text };
+function modelUrl() {
+  return `${MF_BASE}/models/${MF_MODEL}`;
 }
 
-function extractCoverageIds(xml) {
-  const ids = [];
-  const re = /<wcs:CoverageId>([^<]+)<\/wcs:CoverageId>/g;
-  let m;
-  while ((m = re.exec(xml))) {
-    ids.push(m[1]);
-  }
-  return ids;
+function gridsUrl() {
+  return `${MF_BASE}/models/${MF_MODEL}/grids`;
 }
 
-function latestRunStamp(ids) {
-  const stamps = [];
-  const re = /(\d{8}T\d{2})/g;
-
-  for (const id of ids) {
-    let m;
-    while ((m = re.exec(id))) {
-      stamps.push(m[1]);
-    }
-  }
-
-  if (!stamps.length) return null;
-  stamps.sort();
-  return stamps[stamps.length - 1];
+function gridUrl(grid) {
+  return `${MF_BASE}/models/${MF_MODEL}/grids/${encodeURIComponent(grid)}`;
 }
 
-function parseAxisLabels(xml) {
-  const m = xml.match(/axisLabels="([^"]+)"/);
-  if (!m) return [];
-  return m[1].trim().split(/\s+/);
+function packagesUrl(grid) {
+  return `${MF_BASE}/models/${MF_MODEL}/grids/${encodeURIComponent(grid)}/packages`;
 }
 
-function parseCoefficientsForAxis(xml, axisName) {
-  const re = new RegExp(
-    `<gmlrgrid:gridAxesSpanned>\\s*${axisName}\\s*<\\/gmlrgrid:gridAxesSpanned>[\\s\\S]*?<gmlrgrid:coefficients>([\\s\\S]*?)<\\/gmlrgrid:coefficients>`,
-    "i"
+function packageUrl(grid, pkg, referencetime = null) {
+  const u = new URL(
+    `${MF_BASE}/models/${MF_MODEL}/grids/${encodeURIComponent(grid)}/packages/${encodeURIComponent(pkg)}`
   );
-  const m = xml.match(re);
-  if (!m) return null;
-  return m[1].trim().split(/\s+/).filter(Boolean);
+  if (referencetime) u.searchParams.set("referencetime", referencetime);
+  return u.toString();
 }
 
-function firstNumber(list, fallback) {
-  if (!list) return fallback;
-  for (const v of list) {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return fallback;
+function productRestUrl(grid, pkg, referencetime, time, format = "grib2") {
+  const u = new URL(
+    `${MF_BASE}/models/${MF_MODEL}/grids/${encodeURIComponent(grid)}/packages/${encodeURIComponent(pkg)}/${MF_PRODUCT_ID}`
+  );
+  u.searchParams.set("referencetime", referencetime);
+  u.searchParams.set("time", time);
+  u.searchParams.set("format", format);
+  return u.toString();
 }
 
-function pickCoverageId(ids, stamp, cfg) {
-  for (const c of cfg.candidates || []) {
-    const found = ids.find((x) => {
-      if (!x.startsWith(c.startsWith)) return false;
-      if (c.endsWith && !x.endsWith(c.endsWith)) return false;
-      if (stamp && !x.includes(stamp)) return false;
-      return true;
-    });
-    if (found) return found;
-  }
-  return null;
-}
-
-function convertValue(v, mode) {
-  if (!Number.isFinite(v)) return null;
-  if (mode === "k_to_c") return v - 273.15;
-  if (mode === "pa_to_hpa") return v / 100.0;
-  return v;
-}
-
-async function resolve(run, variable) {
-  const varKey = normalizeVariableName(variable);
-  if (!varKey) {
-    return { ok: false, status: 400, error: "unknown_variable", variable };
-  }
-
-  const cfg = AROME_VARIABLES[varKey];
-  const cap = await fetchText(capabilitiesUrl(run));
-
-  if (!cap.ok) {
-    return {
-      ok: false,
-      status: cap.status,
-      error: "capabilities_failed",
-      detail: cap.text.slice(0, 300),
-    };
-  }
-
-  const ids = extractCoverageIds(cap.text);
-  const stamp = latestRunStamp(ids);
-
-  if (!stamp) {
-    return { ok: false, status: 500, error: "no_run_stamp_found" };
-  }
-
-  const coverageId = pickCoverageId(ids, stamp, cfg);
-
-  if (!coverageId) {
-    return {
-      ok: false,
-      status: 500,
-      error: "coverage_not_found",
-      variable: varKey,
-      stamp,
-      debug_candidates: cfg.candidates || [],
-    };
-  }
-
-  const du = new URL(describeUrl(run));
-  du.searchParams.set("coverageId", coverageId);
-
-  const desc = await fetchText(du.toString());
-  if (!desc.ok) {
-    return {
-      ok: false,
-      status: desc.status,
-      error: "describe_failed",
-      variable: varKey,
-      coverageId,
-      detail: desc.text.slice(0, 400),
-    };
-  }
-
-  const axisLabels = parseAxisLabels(desc.text);
-  const timeCoeffs = parseCoefficientsForAxis(desc.text, "time");
-  const timeSeconds = firstNumber(timeCoeffs, 3600);
-
-  let heightVal = null;
-  if (axisLabels.includes("height")) {
-    const heightCoeffs = parseCoefficientsForAxis(desc.text, "height");
-    const availableHeights = (heightCoeffs || [])
-      .map(Number)
-      .filter(Number.isFinite);
-
-    if (
-      Number.isFinite(cfg.defaultHeight) &&
-      availableHeights.includes(cfg.defaultHeight)
-    ) {
-      heightVal = cfg.defaultHeight;
-    } else if (availableHeights.length > 0) {
-      heightVal = availableHeights[0];
-    } else if (Number.isFinite(cfg.defaultHeight)) {
-      heightVal = cfg.defaultHeight;
-    }
-  }
-
-  return {
-    ok: true,
-    variable: varKey,
-    stamp,
-    coverageId,
-    timeSeconds,
-    heightVal,
-    axisLabels,
-  };
-}
-
-async function getCoverageTiff({ run, coverageId, timeSeconds, heightVal, bbox }) {
-  const u = new URL(getCoverageUrl(run));
-  u.searchParams.set("service", "WCS");
-  u.searchParams.set("version", "2.0.1");
-  u.searchParams.set("request", "GetCoverage");
-  u.searchParams.set("coverageid", coverageId);
-  u.searchParams.set("format", "image/tiff");
-
-  u.searchParams.append("subset", `long(${bbox.longMin},${bbox.longMax})`);
-  u.searchParams.append("subset", `lat(${bbox.latMin},${bbox.latMax})`);
-  u.searchParams.append("subset", `time(${timeSeconds})`);
-
-  if (heightVal != null) {
-    u.searchParams.append("subset", `height(${heightVal})`);
-  }
-
-  const r = await fetch(u.toString(), {
-    headers: {
-      apikey: process.env.AROME_APIKEY || "",
-      accept: "*/*",
-    },
-  });
-
-  const buf = await r.arrayBuffer();
-  const ct = r.headers.get("content-type") || "application/octet-stream";
-  return { status: r.status, ct, buf };
-}
-
-async function sampleGeoTiff(arrayBuffer, reducer = "max") {
-  const tiff = await fromArrayBuffer(arrayBuffer);
-  const image = await tiff.getImage();
-  const width = image.getWidth();
-  const height = image.getHeight();
-
-  const samples = 5;
-  const values = [];
-
-  for (let yi = 0; yi < samples; yi++) {
-    for (let xi = 0; xi < samples; xi++) {
-      const x = Math.round((xi / (samples - 1)) * (width - 1));
-      const y = Math.round((yi / (samples - 1)) * (height - 1));
-      const ras = await image.readRasters({ window: [x, y, x + 1, y + 1] });
-      const v = ras?.[0]?.[0];
-      if (Number.isFinite(v)) values.push(v);
-    }
-  }
-
-  if (!values.length) return null;
-  if (reducer === "max") return Math.max(...values);
-  if (reducer === "min") return Math.min(...values);
-  if (reducer === "mean") {
-    return values.reduce((a, b) => a + b, 0) / values.length;
-  }
-
-  return null;
-}
-
-function buildValuePayload(variable, rawValue) {
-  const varKey = normalizeVariableName(variable);
-  const cfg = AROME_VARIABLES[varKey];
-  const converted = convertValue(rawValue, cfg.convert);
-
-  if (typeof cfg.postProcess === "function") {
-    return cfg.postProcess(converted);
-  }
-
-  return { [cfg.responseKey]: converted };
-}
-
-function listMatchingCoverageIds(ids, variable) {
-  const varKey = normalizeVariableName(variable);
-  if (!varKey) return [];
-  const cfg = AROME_VARIABLES[varKey];
-
-  const out = [];
-  for (const id of ids) {
-    for (const c of cfg.candidates || []) {
-      const okStart = id.startsWith(c.startsWith);
-      const okEnd = c.endsWith ? id.endsWith(c.endsWith) : true;
-      if (okStart && okEnd) {
-        out.push(id);
-        break;
-      }
-    }
-  }
-  return out;
+function productKvpUrl(grid, pkg, referencetime, time, format = "grib2") {
+  const u = new URL(`${MF_BASE}/${MF_PRODUCT_ID}`);
+  u.searchParams.set("grid", grid);
+  u.searchParams.set("package", pkg);
+  u.searchParams.set("referencetime", referencetime);
+  u.searchParams.set("time", time);
+  u.searchParams.set("format", format);
+  return u.toString();
 }
 
 // ========================================================
-// CORE AROME
+// AUTO-SELECTION HELPERS
 // ========================================================
 
-async function getVariableValue({ variable, run, lat, lon, radiusKm, timeSeconds = null }) {
-  const varKey = normalizeVariableName(variable);
-  const cfg = AROME_VARIABLES[varKey];
-
-  if (!cfg) throw new Error("unknown_variable");
-
-  const info = await resolve(run, varKey);
-  if (!info.ok) return info;
-
-  const bbox = bboxFromRadiusKm(lat, lon, radiusKm);
-  const tSec = Number.isFinite(timeSeconds) ? timeSeconds : info.timeSeconds;
-
-  const cov = await getCoverageTiff({
-    run,
-    coverageId: info.coverageId,
-    timeSeconds: tSec,
-    heightVal: info.heightVal,
-    bbox,
-  });
-
-  if (cov.status < 200 || cov.status >= 300) {
-    return { ok: false, status: cov.status, error: "download_failed" };
-  }
-
-  const rawValue = await sampleGeoTiff(cov.buf, cfg.reducer);
-  const payload = buildValuePayload(varKey, rawValue);
-
-  return {
-    ok: true,
-    variable: varKey,
-    run,
-    coverageId: info.coverageId,
-    timeSeconds: tSec,
-    height: info.heightVal,
-    lat,
-    lon,
-    radius_km: radiusKm,
-    unit: cfg.unit,
-    ...payload,
-  };
+async function getGrids() {
+  return await fetchJson(gridsUrl());
 }
 
-async function getVariableSeries({ variable, run, lat, lon, radiusKm, hours }) {
-  const varKey = normalizeVariableName(variable);
-  const cfg = AROME_VARIABLES[varKey];
+function normalizeArrayPayload(json) {
+  if (Array.isArray(json)) return json;
+  if (Array.isArray(json?.grids)) return json.grids;
+  if (Array.isArray(json?.packages)) return json.packages;
+  if (Array.isArray(json?.data)) return json.data;
+  if (Array.isArray(json?.products)) return json.products;
+  return [];
+}
 
-  if (!cfg) {
-    return { ok: false, status: 400, error: "unknown_variable", variable };
+async function autoPickGrid() {
+  const j = await getGrids();
+  const arr = normalizeArrayPayload(j);
+
+  if (!arr.length) {
+    return { ok: false, error: "no_grids_found", raw: j };
   }
 
-  const info = await resolve(run, varKey);
-  if (!info.ok) return info;
+  const first = arr[0];
+  const grid =
+    first?.grid ??
+    first?.id ??
+    first?.name ??
+    first?.value ??
+    first;
 
-  const step = Number(info.timeSeconds || 3600);
-  const steps = Math.floor((hours * 3600) / step);
-  const bbox = bboxFromRadiusKm(lat, lon, radiusKm);
+  return { ok: true, grid, raw: arr };
+}
 
-  const series = [];
-  for (let i = 1; i <= steps; i++) {
-    const tSec = i * step;
+async function getPackages(grid) {
+  return await fetchJson(packagesUrl(grid));
+}
 
-    const cov = await getCoverageTiff({
-      run,
-      coverageId: info.coverageId,
-      timeSeconds: tSec,
-      heightVal: info.heightVal,
-      bbox,
-    });
+async function autoPickPackage(grid) {
+  const j = await getPackages(grid);
+  const arr = normalizeArrayPayload(j);
 
-    if (cov.status < 200 || cov.status >= 300) {
-      series.push({
-        t_seconds: tSec,
-        ok: false,
-        error: `download_${cov.status}`,
-      });
-      continue;
-    }
-
-    const rawValue = await sampleGeoTiff(cov.buf, cfg.reducer);
-    const payload = buildValuePayload(varKey, rawValue);
-
-    series.push({
-      t_seconds: tSec,
-      ok: true,
-      ...payload,
-    });
+  if (!arr.length) {
+    return { ok: false, error: "no_packages_found", raw: j };
   }
 
-  return {
-    ok: true,
-    variable: varKey,
-    run,
-    coverageId: info.coverageId,
-    height: info.heightVal,
-    step_seconds: step,
-    hours,
-    lat,
-    lon,
-    radius_km: radiusKm,
-    unit: cfg.unit,
-    series,
-  };
+  // priorité SP1 si présent
+  const names = arr.map((x) => x?.package ?? x?.name ?? x?.id ?? x);
+  const sp1 = names.find((x) => String(x).toUpperCase() === "SP1");
+  return { ok: true, package: sp1 || names[0], raw: arr };
+}
+
+async function getPackageDetails(grid, pkg, referencetime = null) {
+  return await fetchJson(packageUrl(grid, pkg, referencetime));
+}
+
+function extractReferenceTimes(j) {
+  const candidates =
+    j?.referencetimes ||
+    j?.referenceTimes ||
+    j?.references ||
+    j?.runs ||
+    j?.data ||
+    [];
+
+  if (Array.isArray(candidates)) {
+    return candidates
+      .map((x) => x?.referencetime || x?.referenceTime || x?.value || x)
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function extractTimes(j) {
+  const candidates =
+    j?.times ||
+    j?.echeances ||
+    j?.products ||
+    j?.data ||
+    [];
+
+  if (Array.isArray(candidates)) {
+    return candidates
+      .map((x) => x?.time || x?.echeance || x?.value || x)
+      .filter(Boolean);
+  }
+  return [];
+}
+
+async function autoPickReferenceTime(grid, pkg) {
+  const j = await getPackageDetails(grid, pkg);
+  const refs = extractReferenceTimes(j);
+
+  if (refs.length) {
+    const sorted = refs.slice().sort();
+    return { ok: true, referencetime: sorted[sorted.length - 1], raw: j };
+  }
+
+  // fallback: now arrondi à l’heure UTC
+  const d = new Date();
+  d.setUTCMinutes(0, 0, 0);
+  return { ok: true, referencetime: isoUtcNoMs(d), raw: j, fallback: true };
 }
 
 // ========================================================
@@ -836,23 +376,26 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "CycloneOI AROME API",
-    status: "running",
+    mode: "AROME-OM catalogue + product download proxy",
+    model: MF_MODEL,
+    product: MF_PRODUCT_ID,
+    mf_base: MF_BASE,
     places_source: PLACES_SOURCE_URL,
-    supported_variables: Object.keys(AROME_VARIABLES),
+    note: "Cette version utilise la bonne API Paquet Modèles. Elle télécharge/proxyfie productOMOI en GRIB2 mais ne parse pas encore les messages GRIB2 par variable/point.",
     endpoints: [
       "/v1/arome/places",
-      "/v1/arome/debug/capabilities?run=001",
-      "/v1/arome/debug/resolve?run=001&variable=rain",
-      "/v1/arome/debug/match?run=001&variable=temp",
-      "/v1/arome/rain/value?city=saint-denis&run=001&radius_km=5",
-      "/v1/arome/gust/value?city=saint-denis&run=001&radius_km=5",
-      "/v1/arome/temp/value?city=saint-denis&run=001&radius_km=5",
-      "/v1/arome/rh/value?city=saint-denis&run=001&radius_km=5",
-      "/v1/arome/pressure/value?city=saint-denis&run=001&radius_km=5",
-      "/v1/arome/rain/series?city=saint-denis&run=001&hours=48&radius_km=5",
-      "/v1/arome/gust/series?city=saint-denis&run=001&hours=48&radius_km=5",
-      "/v1/arome/point/series?vars=rain,gust,temp,rh,dewpoint,pressure&city=saint-denis&run=001&hours=48&radius_km=5",
-    ],
+      "/v1/arome/model",
+      "/v1/arome/grids",
+      "/v1/arome/grids/auto",
+      "/v1/arome/packages?grid=...",
+      "/v1/arome/packages/auto?grid=...",
+      "/v1/arome/package?grid=...&package=SP1",
+      "/v1/arome/package/auto?grid=...&package=SP1",
+      "/v1/arome/product/url?grid=...&package=SP1&referencetime=...&time=001H",
+      "/v1/arome/product/download?grid=...&package=SP1&referencetime=...&time=001H",
+      "/v1/arome/product/auto?time=001H",
+      "/v1/arome/point/product/auto?city=saint-denis&time=001H"
+    ]
   });
 });
 
@@ -875,286 +418,226 @@ app.get("/v1/arome/places", async (req, res) => {
   }
 });
 
-app.get("/v1/arome/debug/capabilities", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const cap = await fetchText(capabilitiesUrl(run));
-
-  if (!cap.ok) {
-    return res.status(cap.status).json({
-      ok: false,
-      error: "capabilities_failed",
-      detail: cap.text.slice(0, 500),
-    });
-  }
-
-  const ids = extractCoverageIds(cap.text);
-
-  return res.json({
-    ok: true,
-    run,
-    count: ids.length,
-    latest_stamp: latestRunStamp(ids),
-    ids,
-  });
-});
-
-app.get("/v1/arome/debug/match", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const variable = String(req.query.variable || "rain");
-
-  const cap = await fetchText(capabilitiesUrl(run));
-  if (!cap.ok) {
-    return res.status(cap.status).json({
-      ok: false,
-      error: "capabilities_failed",
-      detail: cap.text.slice(0, 500),
-    });
-  }
-
-  const ids = extractCoverageIds(cap.text);
-  const matches = listMatchingCoverageIds(ids, variable);
-
-  res.json({
-    ok: true,
-    run,
-    variable,
-    normalized_variable: normalizeVariableName(variable),
-    matches_count: matches.length,
-    matches,
-  });
-});
-
-app.get("/v1/arome/debug/resolve", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const variable = String(req.query.variable || req.query.type || "rain");
-  const out = await resolve(run, variable);
-  res.status(out.ok ? 200 : out.status || 500).json(out);
-});
-
-// Téléchargement brut TIFF pour une variable
-app.get("/v1/arome/:variable/download", async (req, res) => {
+app.get("/v1/arome/model", async (req, res) => {
   try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const variable = String(req.params.variable || "");
-    const varKey = normalizeVariableName(variable);
-
-    if (!varKey) {
-      return res.status(400).json({ ok: false, error: "unknown_variable" });
-    }
-
-    const info = await resolve(run, varKey);
-    if (!info.ok) return res.status(info.status || 500).json(info);
-
-    const point = await getPoint(req);
-    const radiusKm = clamp(
-      parseNum(req.query.radius_km, DEFAULT_RADIUS_KM),
-      1,
-      MAX_RADIUS_KM
-    );
-
-    const bbox = bboxFromRadiusKm(point.lat, point.lon, radiusKm);
-
-    const out = await getCoverageTiff({
-      run,
-      coverageId: info.coverageId,
-      timeSeconds: info.timeSeconds,
-      heightVal: info.heightVal,
-      bbox,
-    });
-
-    res.status(out.status);
-    res.setHeader("Cache-Control", "public, max-age=600");
-    res.setHeader("Content-Type", out.ct);
-    res.send(Buffer.from(out.buf));
+    const j = await fetchJson(modelUrl());
+    res.json({ ok: true, model: MF_MODEL, data: j });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "download_failed",
-      message: String(e?.message || e),
-    });
+    res.status(500).json({ ok: false, error: "model_failed", message: String(e?.message || e) });
   }
 });
 
-// Valeur ponctuelle d'une variable
-app.get("/v1/arome/:variable/value", async (req, res) => {
+app.get("/v1/arome/grids", async (req, res) => {
   try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const variable = String(req.params.variable || "");
-    const radiusKm = clamp(
-      parseNum(req.query.radius_km, DEFAULT_RADIUS_KM),
-      1,
-      MAX_RADIUS_KM
-    );
+    const j = await getGrids();
+    res.json({ ok: true, model: MF_MODEL, data: j });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "grids_failed", message: String(e?.message || e) });
+  }
+});
 
-    const point = await getPoint(req);
+app.get("/v1/arome/grids/auto", async (req, res) => {
+  try {
+    const out = await autoPickGrid();
+    res.status(out.ok ? 200 : 500).json(out);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "grid_auto_failed", message: String(e?.message || e) });
+  }
+});
 
-    const out = await getVariableValue({
-      variable,
-      run,
-      lat: point.lat,
-      lon: point.lon,
-      radiusKm,
-    });
+app.get("/v1/arome/packages", async (req, res) => {
+  try {
+    const grid = String(req.query.grid || "").trim();
+    if (!grid) return res.status(400).json({ ok: false, error: "grid_required" });
 
-    if (!out.ok) {
-      return res.status(out.status || 500).json(out);
+    const j = await getPackages(grid);
+    res.json({ ok: true, grid, data: j });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "packages_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/packages/auto", async (req, res) => {
+  try {
+    let grid = String(req.query.grid || "").trim();
+    if (!grid) {
+      const g = await autoPickGrid();
+      if (!g.ok) return res.status(500).json(g);
+      grid = String(g.grid);
     }
 
-    res.json({
-      ...out,
-      point_source: point.source,
-      city: point.city,
-      label: point.label,
+    const out = await autoPickPackage(grid);
+    res.status(out.ok ? 200 : 500).json({ grid, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "package_auto_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/package", async (req, res) => {
+  try {
+    const grid = String(req.query.grid || "").trim();
+    const pkg = String(req.query.package || "").trim();
+    const referencetime = String(req.query.referencetime || "").trim() || null;
+
+    if (!grid) return res.status(400).json({ ok: false, error: "grid_required" });
+    if (!pkg) return res.status(400).json({ ok: false, error: "package_required" });
+
+    const j = await getPackageDetails(grid, pkg, referencetime);
+    res.json({ ok: true, grid, package: pkg, referencetime, data: j });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "package_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/package/auto", async (req, res) => {
+  try {
+    let grid = String(req.query.grid || "").trim();
+    let pkg = String(req.query.package || "").trim();
+
+    if (!grid) {
+      const g = await autoPickGrid();
+      if (!g.ok) return res.status(500).json(g);
+      grid = String(g.grid);
+    }
+
+    if (!pkg) {
+      const p = await autoPickPackage(grid);
+      if (!p.ok) return res.status(500).json(p);
+      pkg = String(p.package);
+    }
+
+    const ref = await autoPickReferenceTime(grid, pkg);
+    res.status(ref.ok ? 200 : 500).json({
+      ok: ref.ok,
+      grid,
+      package: pkg,
+      referencetime: ref.referencetime,
+      fallback: !!ref.fallback,
+      raw: ref.raw
     });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "value_failed",
-      message: String(e?.message || e),
-    });
+    res.status(500).json({ ok: false, error: "package_auto_failed", message: String(e?.message || e) });
   }
 });
 
-// Série d'une seule variable
-app.get("/v1/arome/:variable/series", async (req, res) => {
+app.get("/v1/arome/product/url", async (req, res) => {
   try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const variable = String(req.params.variable || "");
-    const hours = clamp(
-      parseInt(String(req.query.hours || DEFAULT_HOURS), 10) || DEFAULT_HOURS,
-      1,
-      MAX_HOURS
-    );
-    const radiusKm = clamp(
-      parseNum(req.query.radius_km, DEFAULT_RADIUS_KM),
-      1,
-      MAX_RADIUS_KM
-    );
+    const grid = String(req.query.grid || "").trim();
+    const pkg = String(req.query.package || "").trim();
+    const referencetime = String(req.query.referencetime || "").trim();
+    const time = String(req.query.time || "").trim();
+    const format = String(req.query.format || "grib2").trim();
 
-    const point = await getPoint(req);
-
-    const out = await getVariableSeries({
-      variable,
-      run,
-      lat: point.lat,
-      lon: point.lon,
-      radiusKm,
-      hours,
-    });
-
-    if (!out.ok) {
-      return res.status(out.status || 500).json(out);
-    }
-
-    res.json({
-      ...out,
-      point_source: point.source,
-      city: point.city,
-      label: point.label,
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "series_failed",
-      message: String(e?.message || e),
-    });
-  }
-});
-
-// Série multi-variables
-app.get("/v1/arome/point/series", async (req, res) => {
-  try {
-    const run = String(req.query.run || RUN_DEFAULT);
-    const hours = clamp(
-      parseInt(String(req.query.hours || DEFAULT_HOURS), 10) || DEFAULT_HOURS,
-      1,
-      MAX_HOURS
-    );
-    const radiusKm = clamp(
-      parseNum(req.query.radius_km, DEFAULT_RADIUS_KM),
-      1,
-      MAX_RADIUS_KM
-    );
-
-    const point = await getPoint(req);
-
-    const vars = String(req.query.vars || "")
-      .split(",")
-      .map((v) => normalizeVariableName(v))
-      .filter(Boolean);
-
-    if (!vars.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "vars_required",
-        message: "Ex: ?vars=rain,gust,temp,rh,dewpoint,pressure",
-      });
-    }
-
-    const hourly = {};
-    const meta = {};
-
-    for (const v of vars) {
-      const out = await getVariableSeries({
-        variable: v,
-        run,
-        lat: point.lat,
-        lon: point.lon,
-        radiusKm,
-        hours,
-      });
-
-      if (!out.ok) {
-        hourly[v] = {
-          ok: false,
-          error: out.error || "series_failed",
-          detail: out.detail || null,
-        };
-      } else {
-        hourly[v] = out.series;
-        meta[v] = {
-          coverageId: out.coverageId,
-          height: out.height,
-          step_seconds: out.step_seconds,
-          unit: out.unit,
-        };
-      }
-    }
+    if (!grid) return res.status(400).json({ ok: false, error: "grid_required" });
+    if (!pkg) return res.status(400).json({ ok: false, error: "package_required" });
+    if (!referencetime) return res.status(400).json({ ok: false, error: "referencetime_required" });
+    if (!time) return res.status(400).json({ ok: false, error: "time_required" });
 
     res.json({
       ok: true,
-      run,
-      hours,
+      grid,
+      package: pkg,
+      referencetime,
+      time,
+      format,
+      url_rest: productRestUrl(grid, pkg, referencetime, time, format),
+      url_kvp: productKvpUrl(grid, pkg, referencetime, time, format),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "product_url_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/product/download", async (req, res) => {
+  try {
+    const grid = String(req.query.grid || "").trim();
+    const pkg = String(req.query.package || "").trim();
+    const referencetime = String(req.query.referencetime || "").trim();
+    const time = String(req.query.time || "").trim();
+    const format = String(req.query.format || "grib2").trim();
+
+    if (!grid) return res.status(400).json({ ok: false, error: "grid_required" });
+    if (!pkg) return res.status(400).json({ ok: false, error: "package_required" });
+    if (!referencetime) return res.status(400).json({ ok: false, error: "referencetime_required" });
+    if (!time) return res.status(400).json({ ok: false, error: "time_required" });
+
+    const url = productRestUrl(grid, pkg, referencetime, time, format);
+    const out = await fetchBuffer(url);
+
+    res.setHeader("Content-Type", out.ct);
+    res.setHeader("Cache-Control", "public, max-age=600");
+    res.send(Buffer.from(out.buf));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "product_download_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/product/auto", async (req, res) => {
+  try {
+    const requestedTime = String(req.query.time || "001H").trim();
+    const format = String(req.query.format || "grib2").trim();
+
+    const g = await autoPickGrid();
+    if (!g.ok) return res.status(500).json(g);
+
+    const p = await autoPickPackage(String(g.grid));
+    if (!p.ok) return res.status(500).json(p);
+
+    const r = await autoPickReferenceTime(String(g.grid), String(p.package));
+    if (!r.ok) return res.status(500).json(r);
+
+    res.json({
+      ok: true,
+      model: MF_MODEL,
+      grid: String(g.grid),
+      package: String(p.package),
+      referencetime: r.referencetime,
+      time: requestedTime,
+      format,
+      url_rest: productRestUrl(String(g.grid), String(p.package), r.referencetime, requestedTime, format),
+      url_kvp: productKvpUrl(String(g.grid), String(p.package), r.referencetime, requestedTime, format),
+      note: "Étape suivante: parser le GRIB2 téléchargé pour extraire les variables par point."
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "product_auto_failed", message: String(e?.message || e) });
+  }
+});
+
+app.get("/v1/arome/point/product/auto", async (req, res) => {
+  try {
+    const point = await getPoint(req);
+    const requestedTime = String(req.query.time || "001H").trim();
+    const format = String(req.query.format || "grib2").trim();
+
+    const g = await autoPickGrid();
+    if (!g.ok) return res.status(500).json(g);
+
+    const p = await autoPickPackage(String(g.grid));
+    if (!p.ok) return res.status(500).json(p);
+
+    const r = await autoPickReferenceTime(String(g.grid), String(p.package));
+    if (!r.ok) return res.status(500).json(r);
+
+    res.json({
+      ok: true,
       point_source: point.source,
       city: point.city,
       label: point.label,
       lat: point.lat,
       lon: point.lon,
-      radius_km: radiusKm,
-      vars,
-      meta,
-      hourly,
+      model: MF_MODEL,
+      grid: String(g.grid),
+      package: String(p.package),
+      referencetime: r.referencetime,
+      time: requestedTime,
+      format,
+      url_rest: productRestUrl(String(g.grid), String(p.package), r.referencetime, requestedTime, format),
+      url_kvp: productKvpUrl(String(g.grid), String(p.package), r.referencetime, requestedTime, format),
+      note: "Le point est résolu, mais cette version ne lit pas encore le contenu GRIB2."
     });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "point_series_failed",
-      message: String(e?.message || e),
-    });
+    res.status(500).json({ ok: false, error: "point_product_auto_failed", message: String(e?.message || e) });
   }
-});
-
-// Compat legacy
-app.get("/v1/arome/rain/latest", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const out = await resolve(run, "rain");
-  res.status(out.ok ? 200 : out.status || 500).json(out);
-});
-
-app.get("/v1/arome/gust/latest", async (req, res) => {
-  const run = String(req.query.run || RUN_DEFAULT);
-  const out = await resolve(run, "gust");
-  res.status(out.ok ? 200 : out.status || 500).json(out);
 });
 
 app.listen(PORT, () => {
