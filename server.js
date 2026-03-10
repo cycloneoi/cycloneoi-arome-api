@@ -267,6 +267,8 @@ function normalizeArrayPayload(json) {
   if (Array.isArray(json?.packages)) return json.packages;
   if (Array.isArray(json?.data)) return json.data;
   if (Array.isArray(json?.products)) return json.products;
+  if (Array.isArray(json?.links)) return json.links;
+  if (Array.isArray(json?.data?.links)) return json.data.links;
   return [];
 }
 
@@ -278,13 +280,31 @@ async function autoPickGrid() {
     return { ok: false, error: "no_grids_found", raw: j };
   }
 
-  const first = arr[0];
-  const grid =
-    first?.grid ??
-    first?.id ??
-    first?.name ??
-    first?.value ??
-    first;
+  // On ignore le lien "self" et on prend une vraie grille
+  const candidate =
+    arr.find((x) => {
+      const href = String(x?.href || "");
+      return /\/grids\/[^/]+$/.test(href) && !href.endsWith("/grids");
+    }) || arr[0];
+
+  let grid =
+    candidate?.grid ??
+    candidate?.id ??
+    candidate?.name ??
+    candidate?.value ??
+    null;
+
+  if (!grid) {
+    const href = String(candidate?.href || "");
+    const m = href.match(/\/grids\/([^/]+)$/);
+    if (m) {
+      grid = decodeURIComponent(m[1]);
+    }
+  }
+
+  if (!grid) {
+    return { ok: false, error: "grid_parse_failed", raw: candidate };
+  }
 
   return { ok: true, grid, raw: arr };
 }
