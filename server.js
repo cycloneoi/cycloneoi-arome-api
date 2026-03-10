@@ -351,15 +351,45 @@ async function loadPlaces() {
   }
 
   const places = rawPlaces
-    .map((p) => ({
-      slug: p.slug,
-      label: p.label || p.name || p.slug,
-      lat: Number(p.lat),
-      lon: Number(p.lon),
-    }))
-    .filter((p) => p.slug && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    .map((p) => {
+      const lat =
+        Number(p.lat) ||
+        Number(p.latitude) ||
+        Number(p.latitude_deg) ||
+        Number(p?.coords?.lat) ||
+        Number(p?.geometry?.lat) ||
+        Number(p?.location?.lat);
+
+      const lon =
+        Number(p.lon) ||
+        Number(p.lng) ||
+        Number(p.long) ||
+        Number(p.longitude) ||
+        Number(p.longitude_deg) ||
+        Number(p?.coords?.lon) ||
+        Number(p?.coords?.lng) ||
+        Number(p?.geometry?.lon) ||
+        Number(p?.geometry?.lng) ||
+        Number(p?.location?.lon) ||
+        Number(p?.location?.lng);
+
+      return {
+        slug: p.slug,
+        label: p.label || p.name || p.slug,
+        lat,
+        lon,
+        raw: p,
+      };
+    })
+    .filter(
+      (p) =>
+        p.slug &&
+        Number.isFinite(p.lat) &&
+        Number.isFinite(p.lon)
+    );
 
   if (!places.length) {
+    console.log("DEBUG places payload:", JSON.stringify(rawPlaces.slice(0, 3), null, 2));
     throw new Error("places_empty_or_no_coordinates");
   }
 
