@@ -375,13 +375,26 @@ app.options("*", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "CycloneOI AROME API NEW BUILD",
-    build_check: "MODEL-GRIDS-ROUTES",
+    service: "CycloneOI AROME API",
+    mode: "AROME-OM catalogue + product download proxy",
+    model: MF_MODEL,
+    product: MF_PRODUCT_ID,
+    mf_base: MF_BASE,
+    places_source: PLACES_SOURCE_URL,
+    note: "Cette version utilise la bonne API Paquet Modèles. Elle télécharge/proxyfie productOMOI en GRIB2 mais ne parse pas encore les messages GRIB2 par variable/point.",
     endpoints: [
+      "/v1/arome/places",
       "/v1/arome/model",
       "/v1/arome/grids",
-      "/v1/arome/packages",
-      "/v1/arome/product/auto"
+      "/v1/arome/grids/auto",
+      "/v1/arome/packages?grid=...",
+      "/v1/arome/packages/auto?grid=...",
+      "/v1/arome/package?grid=...&package=SP1",
+      "/v1/arome/package/auto?grid=...&package=SP1",
+      "/v1/arome/product/url?grid=...&package=SP1&referencetime=...&time=001H",
+      "/v1/arome/product/download?grid=...&package=SP1&referencetime=...&time=001H",
+      "/v1/arome/product/auto?time=001H",
+      "/v1/arome/point/product/auto?city=saint-denis&time=001H"
     ]
   });
 });
