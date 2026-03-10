@@ -274,39 +274,40 @@ function normalizeArrayPayload(json) {
 
 async function autoPickGrid() {
   const j = await getGrids();
-  const arr = normalizeArrayPayload(j);
 
-  if (!arr.length) {
+  const links =
+    (Array.isArray(j?.links) ? j.links : null) ||
+    (Array.isArray(j?.data?.links) ? j.data.links : null) ||
+    [];
+
+  if (!links.length) {
     return { ok: false, error: "no_grids_found", raw: j };
   }
 
-  // On ignore le lien "self" et on prend une vraie grille
-  const candidate =
-    arr.find((x) => {
-      const href = String(x?.href || "");
-      return /\/grids\/[^/]+$/.test(href) && !href.endsWith("/grids");
-    }) || arr[0];
+  // On prend un lien qui termine par /grids/<valeur>
+  const candidate = links.find((x) => {
+    const href = String(x?.href || "");
+    return /\/grids\/[^/]+$/.test(href) && !href.endsWith("/grids");
+  });
 
-  let grid =
-    candidate?.grid ??
-    candidate?.id ??
-    candidate?.name ??
-    candidate?.value ??
-    null;
-
-  if (!grid) {
-    const href = String(candidate?.href || "");
-    const m = href.match(/\/grids\/([^/]+)$/);
-    if (m) {
-      grid = decodeURIComponent(m[1]);
-    }
+  if (!candidate) {
+    return { ok: false, error: "grid_link_not_found", raw: links };
   }
 
-  if (!grid) {
+  const href = String(candidate?.href || "");
+  const m = href.match(/\/grids\/([^/]+)$/);
+
+  if (!m) {
     return { ok: false, error: "grid_parse_failed", raw: candidate };
   }
 
-  return { ok: true, grid, raw: arr };
+  const grid = decodeURIComponent(m[1]);
+
+  return {
+    ok: true,
+    grid,
+    raw: links,
+  };
 }
 
 async function getPackages(grid) {
@@ -315,16 +316,35 @@ async function getPackages(grid) {
 
 async function autoPickPackage(grid) {
   const j = await getPackages(grid);
-  const arr = normalizeArrayPayload(j);
 
-  if (!arr.length) {
+  const links =
+    (Array.isArray(j?.links) ? j.links : null) ||
+    (Array.isArray(j?.data?.links) ? j.data.links : null) ||
+    [];
+
+  if (!links.length) {
     return { ok: false, error: "no_packages_found", raw: j };
   }
 
-  // priorité SP1 si présent
-  const names = arr.map((x) => x?.package ?? x?.name ?? x?.id ?? x);
-  const sp1 = names.find((x) => String(x).toUpperCase() === "SP1");
-  return { ok: true, package: sp1 || names[0], raw: arr };
+  const packages = links
+    .map((x) => {
+      const href = String(x?.href || "");
+      const m = href.match(/\/packages\/([^/]+)$/);
+      return m ? decodeURIComponent(m[1]) : null;
+    })
+    .filter(Boolean);
+
+  if (!packages.length) {
+    return { ok: false, error: "package_parse_failed", raw: links };
+  }
+
+  const sp1 = packages.find((x) => String(x).toUpperCase() === "SP1");
+
+  return {
+    ok: true,
+    package: sp1 || packages[0],
+    raw: links,
+  };
 }
 
 async function getPackageDetails(grid, pkg, referencetime = null) {
