@@ -476,6 +476,38 @@ async function resolveAutoProduct(time = "001H", format = "grib2") {
   };
 }
 
+async function resolvePackageProduct(grid, pkg, time = "001H", format = "grib2") {
+  const requestedTime = String(time || "001H").trim();
+  const requestedFormat = String(format || "grib2").trim();
+
+  const r = await autoPickReferenceTime(String(grid), String(pkg));
+  if (!r.ok) return r;
+
+  return {
+    ok: true,
+    model: MF_MODEL,
+    grid: String(grid),
+    package: String(pkg),
+    referencetime: r.referencetime,
+    time: requestedTime,
+    format: requestedFormat,
+    url_rest: productRestUrl(
+      String(grid),
+      String(pkg),
+      r.referencetime,
+      requestedTime,
+      requestedFormat
+    ),
+    url_kvp: productKvpUrl(
+      String(grid),
+      String(pkg),
+      r.referencetime,
+      requestedTime,
+      requestedFormat
+    ),
+  };
+}
+
 // ========================================================
 // ROUTES
 // ========================================================
@@ -514,7 +546,8 @@ app.get("/", (req, res) => {
       "/v1/arome/point/product/auto?city=saint-denis&time=001H",
       "/v1/arome/grib/version",
       "/v1/arome/product/inventory?time=001H",
-      "/v1/arome/point/product/inventory?city=saint-denis&time=001H"
+      "/v1/arome/point/product/inventory?city=saint-denis&time=001H",
+      "/v1/arome/package/inventory?grid=0.025&package=SP2&time=001H"
     ]
   });
 });
@@ -878,6 +911,52 @@ app.get("/v1/arome/point/product/inventory", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "point_product_inventory_failed",
+      message: String(e?.message || e),
+    });
+  } finally {
+    await removeTempFile(filePath);
+  }
+});
+
+app.get("/v1/arome/package/inventory", async (req, res) => {
+  let filePath = null;
+
+  try {
+    const grid = String(req.query.grid || "").trim();
+    const pkg = String(req.query.package || "").trim();
+    const time = String(req.query.time || "001H").trim();
+    const format = String(req.query.format || "grib2").trim();
+
+    if (!grid) {
+      return res.status(400).json({ ok: false, error: "grid_required" });
+    }
+    if (!pkg) {
+      return res.status(400).json({ ok: false, error: "package_required" });
+    }
+
+    const out = await resolvePackageProduct(grid, pkg, time, format);
+    if (!out.ok) {
+      return res.status(500).json(out);
+    }
+
+    filePath = await downloadProductToTempFile(out.url_rest);
+    const inv = await gribLsInventory(filePath);
+
+    res.json({
+      ok: true,
+      model: out.model,
+      grid: out.grid,
+      package: out.package,
+      referencetime: out.referencetime,
+      time: out.time,
+      format: out.format,
+      inventory: inv.stdout,
+      stderr: inv.stderr,
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "package_inventory_failed",
       message: String(e?.message || e),
     });
   } finally {
