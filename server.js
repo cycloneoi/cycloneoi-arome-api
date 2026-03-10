@@ -1,5 +1,5 @@
-const express = require("express");
-const { fromArrayBuffer } = require("geotiff");
+import express from "express";
+import { fromArrayBuffer } from "geotiff";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -283,9 +283,7 @@ function parseNum(v, fallback = null) {
 }
 
 function normalizeSlug(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase();
+  return String(s || "").trim().toLowerCase();
 }
 
 function normalizeVariableName(raw) {
@@ -359,12 +357,7 @@ async function loadPlaces() {
       lat: Number(p.lat),
       lon: Number(p.lon),
     }))
-    .filter(
-      (p) =>
-        p.slug &&
-        Number.isFinite(p.lat) &&
-        Number.isFinite(p.lon)
-    );
+    .filter((p) => p.slug && Number.isFinite(p.lat) && Number.isFinite(p.lon));
 
   if (!places.length) {
     throw new Error("places_empty_or_no_coordinates");
